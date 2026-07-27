@@ -1,0 +1,11 @@
+[project]
+name = "ariel-rl"
+version = "0.1.0"
+description = "Reinforcement learning and baseline schedulers for Ariel target selection."
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

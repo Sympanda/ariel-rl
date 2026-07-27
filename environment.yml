@@ -1,0 +1,45 @@
+name: aRieL
+
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.11
+  - pip
+
+  # Scientific stack
+  - numpy>=2.0
+  - pandas>=2.0
+  - pyarrow>=14.0
+  - matplotlib>=3.8
+  - scipy>=1.12
+
+  # PyTorch (CPU / Apple Silicon MPS — remove the comment below and add pytorch-cuda=12.1 + nvidia channel for CUDA)
+  - pytorch>=2.3
+  - torchvision
+
+  # RL
+  - gymnasium>=1.0
+
+  # Config / IO
+  - pyyaml>=6.0
+
+  # Image / animation output
+  - pillow>=10.0        # PillowWriter for GIF saving (matplotlib animations)
+
+  # Dev / testing
+  - pytest>=8.0
+  - ipykernel          # Jupyter notebook support
+  - jupyterlab
+  - tqdm
+  - rich
+
+  - pip:
+    # Install the project itself in editable mode
+    - -e .
+    # RL training libraries (not reliably up-to-date on conda-forge)
+    - stable-baselines3>=2.3
+    - sb3-contrib>=2.3
+    - tensorboard>=2.14

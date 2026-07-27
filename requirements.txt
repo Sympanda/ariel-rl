@@ -1,0 +1,10 @@
+numpy
+pandas
+pyarrow
+scipy
+matplotlib
+gymnasium
+torch
+pytest
+pyyaml
+tqdm

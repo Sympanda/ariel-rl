@@ -1,0 +1,51 @@
+# Option A — Sparse-dominant reward preset
+#
+# Problem addressed
+# -----------------
+# The default reward has a high dense floor: efficiency_weight=0.5 and
+# progress_weight=0.3 fire on every observation, so even a random agent
+# accumulates ~2k reward per episode.  The RL agent (3M steps) only reaches
+# ~2.5k — a 25% gain that is hard for the optimiser to amplify.
+#
+# Strategy
+# --------
+# 1. Remove the two main floor contributors (efficiency, most of progress).
+# 2. Amplify all sparse signals (tier completions, milestones, terminal).
+#    Expected random reward drops to ~300; RL headroom becomes 5–10×.
+#
+# Usage
+# -----
+#   python -m ariel_rl.scripts.train_agent \
+#       --config configs/env/full.yaml \
+#       --reward-config configs/reward/sparse_dominant.yaml \
+#       --run-name transformer_sparse_v1
+
+reward:
+  # Dense per-step (reduce floor)
+  efficiency_weight:          0.0    # was 0.5 — long slews self-penalise by consuming time
+  progress_weight:            0.05   # was 0.3 — tiny nudge only; sparse signals dominate
+
+  # Coverage diversity (5× stronger than transformer_v1's hardcoded 2×)
+  diversity_multiplier_max:   5.0    # was hardcoded at 2.0
+
+  # Sparse tier completions (amplify 3×)
+  tier1_completion:           3.0    # was 1.0
+  tier2_completion:           10.0   # was 3.0
+  tier3_completion:           30.0   # was 10.0
+
+  # Coverage milestones (amplify ~2.5×)
+  t1_milestone_bonus:         50.0   # was 20.0
+
+  # Terminal episode bonus (amplify 6×)
+  # Now dominates: getting from 80%→100% T1 coverage is worth ~300 pts
+  t1_terminal_weight:         300.0  # was 50.0
+  t1_terminal_power:          2.0    # keep quadratic
+
+  # Keep the rest at defaults
+  near_completion_threshold:  0.7
+  near_completion_scale:      3.0
+  t1_milestone_fractions:     [0.25, 0.5, 0.75, 0.90, 1.0]
+  miss_penalty:               0.1
+  rarity_weight:              0.5
+  rarity_period_ref_days:     365.0
+  subtract_random_baseline:   false

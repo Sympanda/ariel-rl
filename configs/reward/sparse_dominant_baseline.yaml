@@ -1,0 +1,51 @@
+# Option A+B — Sparse-dominant + random-baseline subtraction
+#
+# Extends sparse_dominant.yaml by also centring the per-step reward around
+# zero for random-agent behaviour (Option B).  This means:
+#   - A random agent accumulates ~0 total reward.
+#   - RL reward directly represents "improvement over random".
+#   - PPO advantage estimates are larger and more meaningful.
+#
+# Calibrating random_baseline_per_step
+# -------------------------------------
+# Run one episode of RandomValid with this config (minus the baseline flag)
+# and compute:  total_reward / n_valid_observations
+#
+# With sparse_dominant.yaml weights and ~500 valid obs per episode, expect
+# ~0.4–0.6 per valid step from progress alone.  Start with 0.5 and adjust.
+#
+# Usage
+# -----
+#   python -m ariel_rl.scripts.train_agent \
+#       --config configs/env/full.yaml \
+#       --reward-config configs/reward/sparse_dominant_baseline.yaml \
+#       --run-name transformer_sparse_baseline_v1
+
+reward:
+  # Dense per-step (reduce floor)
+  efficiency_weight:          0.0
+  progress_weight:            0.05
+
+  # Sparse tier completions
+  tier1_completion:           3.0
+  tier2_completion:           10.0
+  tier3_completion:           30.0
+
+  # Coverage milestones
+  t1_milestone_bonus:         50.0
+
+  # Terminal episode bonus
+  t1_terminal_weight:         300.0
+  t1_terminal_power:          2.0
+
+  # Shared defaults
+  near_completion_threshold:  0.7
+  near_completion_scale:      3.0
+  t1_milestone_fractions:     [0.25, 0.5, 0.75, 0.90, 1.0]
+  miss_penalty:               0.1
+  rarity_weight:              0.5
+  rarity_period_ref_days:     365.0
+
+  # Option B — random-baseline subtraction
+  subtract_random_baseline:   true
+  random_baseline_per_step:   0.5    # calibrate: total_random_reward / n_valid_obs

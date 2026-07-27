@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Training outputs & runs
+outputs/
+runs/
+experiments/runs/
+experiments/checkpoints/
+experiments/tensorboard/
+experiments/reports/
+
+# Data
+data/raw/
+data/cache/
+data/processed/
+data/baselines/
+
+# Plots & animations
+plots/
+
+# Logs & misc
+*.log
+.DS_Store

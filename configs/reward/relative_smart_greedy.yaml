@@ -1,0 +1,87 @@
+# Relative reward mode — advantage over SmartGreedy baseline
+#
+# Instead of per-step absolute rewards, the agent receives checkpoint-based
+# signals measuring how much better it's doing than a pre-recorded SmartGreedy
+# trajectory.  This directly addresses reward saturation: SmartGreedy already
+# scores ~1200 per episode with the default config, so per-step rewards have
+# little headroom.  Here the RL agent is rewarded purely for exceeding the
+# reference.
+#
+# Setup (run once before training)
+# ---------------------------------
+#   python scripts/generate_baseline_trajectory.py \
+#       --policy smart_greedy \
+#       --n-episodes 20 \
+#       --config configs/env/simple.yaml \
+#       --out data/baselines/smart_greedy_trajectory.json
+#
+# Then train:
+#   python -m ariel_rl.scripts.train_agent \
+#       --config configs/env/simple.yaml \
+#       --reward-config configs/reward/relative_smart_greedy.yaml \
+#       --run-name transformer_relative_v1
+#
+# How the two checkpoints work
+# ----------------------------
+# Weekly comparison (every 7 mission-days):
+#   reward += comparison_scale × (agent_week_reward − baseline_week_reward)
+#   Gives a rapid nudge: "did you beat SmartGreedy THIS week?"
+#
+# Monthly compound (every 28 mission-days):
+#   reward += compound_scale × (agent_total_so_far − baseline_total_at_this_month)
+#   Gives a compounding signal: "are you consistently ahead overall?"
+#   compound_scale is smaller so this supplements rather than dominates.
+#
+# Tuning notes
+# ------------
+# - comparison_scale=1.0 keeps the weekly diff on the same order as the
+#   absolute rewards the agent accumulates (~10-30 per interval for SmartGreedy).
+# - compound_scale=0.1 means the monthly compound bonus is ~10% of the
+#   cumulative diff — large enough to matter but not overwhelming.
+# - The underlying absolute reward config (tier weights, diversity multiplier)
+#   is still what both the agent and baseline are measured against; change
+#   those as normal and re-run generate_baseline_trajectory.py.
+
+reward:
+  # ---- relative reward mode ----
+  reward_mode: relative
+  comparison_interval_days: 7.0
+  compound_interval_days: 28.0
+  comparison_scale: 1.0
+  compound_scale: 0.1
+  baseline_trajectory_path: data/baselines/smart_greedy_trajectory.json
+
+  # ---- underlying absolute reward config ----
+  # These determine what both the agent and the baseline are measured on.
+  # Use the same values here that you used when generating the trajectory.
+
+  # Sparse tier completions
+  tier1_completion: 1.0
+  tier2_completion: 3.0
+  tier3_completion: 10.0
+
+  # Dense shaping (keep reasonable — the relative diff still benefits from
+  # a smooth per-step signal to accumulate over the interval)
+  efficiency_weight: 0.3
+  progress_weight: 0.1
+
+  # Coverage diversity (5× stronger than transformer_v1's hardcoded 2×)
+  diversity_multiplier_max: 5.0
+
+  # Coverage milestones and terminal
+  t1_milestone_fractions: [0.25, 0.5, 0.75, 0.90, 1.0]
+  t1_milestone_bonus: 20.0
+  t1_terminal_weight: 50.0
+  t1_terminal_power: 2.0
+
+  # Near-completion boost
+  near_completion_threshold: 0.7
+  near_completion_scale: 3.0
+
+  # Rarity
+  rarity_weight: 0.5
+  rarity_period_ref_days: 365.0
+
+  # Penalties
+  miss_penalty: 0.1
+  subtract_random_baseline: false
