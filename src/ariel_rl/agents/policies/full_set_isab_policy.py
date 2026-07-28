@@ -115,13 +115,22 @@ class FullSetISABNet(nn.Module):
             for _ in range(n_isab_layers)
         ])
 
-        # Actor head: per-token score → one logit per planet
-        self.policy_head = nn.Linear(d_model, 1)
+        # Actor head: per-token score conditioned on both the token AND the global
+        # mission state.  This allows logits to depend on mission-wide information
+        # (elapsed time, coverage, accumulated science, etc.) in addition to
+        # per-planet features.
+        #   contextualised_token (d)  ‖  global_embedding (d)  →  (2d)  →  logit
+        self.global_proj_actor = nn.Linear(n_global_features, d_model)
+        self.actor_head = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, 1),
+        )
 
         # Critic: PMA reduces the set to a single summary vector,
         # concatenated with global features before the value MLP.
         self.pma = PMA(d_model, n_heads, k=1)
-        self.global_proj = nn.Linear(n_global_features, d_model)
+        self.global_proj_critic = nn.Linear(n_global_features, d_model)
         self.value_mlp = nn.Sequential(
             nn.Linear(d_model * 2, d_model),
             nn.ReLU(),
@@ -136,7 +145,7 @@ class FullSetISABNet(nn.Module):
                 nn.init.orthogonal_(m.weight, gain=math.sqrt(2))
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        nn.init.orthogonal_(self.policy_head.weight, gain=0.01)
+        nn.init.orthogonal_(self.actor_head[-1].weight, gain=0.01)
         nn.init.orthogonal_(self.value_mlp[-1].weight, gain=1.0)
 
     def forward(
@@ -158,15 +167,18 @@ class FullSetISABNet(nn.Module):
         for isab in self.isab_layers:
             tokens = isab(tokens, key_padding_mask=padding_mask)   # (B, N, d)
 
-        # --- Actor: per-token logit ---
-        logits = self.policy_head(tokens).squeeze(-1)              # (B, N)
+        # --- Actor: per-token logit conditioned on global mission state ---
+        N = tokens.shape[1]
+        g_actor  = self.global_proj_actor(global_feat)             # (B, d)
+        g_expand = g_actor.unsqueeze(1).expand(-1, N, -1)          # (B, N, d)
+        actor_in = th.cat([tokens, g_expand], dim=-1)              # (B, N, 2d)
+        logits   = self.actor_head(actor_in).squeeze(-1)           # (B, N)
 
         # --- Critic: PMA → global embed → value ---
-        summary = self.pma(tokens, key_padding_mask=padding_mask)  # (B, 1, d)
-        summary = summary.squeeze(1)                               # (B, d)
-        g_embed = self.global_proj(global_feat)                    # (B, d)
-        critic_in = th.cat([summary, g_embed], dim=-1)             # (B, 2d)
-        values = self.value_mlp(critic_in).squeeze(-1)             # (B,)
+        summary   = self.pma(tokens, key_padding_mask=padding_mask).squeeze(1)  # (B, d)
+        g_critic  = self.global_proj_critic(global_feat)           # (B, d)
+        critic_in = th.cat([summary, g_critic], dim=-1)            # (B, 2d)
+        values    = self.value_mlp(critic_in).squeeze(-1)          # (B,)
 
         return logits, values
 
@@ -198,42 +210,32 @@ class FullSetISABPolicy(MaskableActorCriticPolicy):
         dropout: float = 0.0,
         **kwargs,
     ) -> None:
-        # Pull out our kwargs before passing to super().__init__
-        self._d_model       = d_model
-        self._n_heads       = n_heads
-        self._n_isab_layers = n_isab_layers
-        self._n_inducing    = n_inducing
-        self._dropout       = dropout
-
+        # Pass net_arch=[] so SB3 builds a minimal default MLP that we never use.
+        # We override forward/evaluate_actions/predict_values to use isab_net.
         super().__init__(
             observation_space,
             action_space,
             lr_schedule,
-            # Disable SB3's default feature extractor (we build our own)
-            features_extractor_class=None,
-            **{k: v for k, v in kwargs.items()
-               if k not in ("features_extractor_class",)},
+            net_arch=[],
+            **kwargs,
         )
 
-    def _build(self, lr_schedule: Schedule) -> None:
-        """Construct the network and optimizer — called by super().__init__."""
-        planet_shape  = self.observation_space["planets"].shape   # (N_max, n_pf)
-        global_shape  = self.observation_space["global"].shape    # (n_gf,)
-        n_planet_feat = planet_shape[-1]
-        n_global_feat = global_shape[0]
+        # Build the ISAB network AFTER super().__init__ (which creates the nn.Module)
+        n_pf = observation_space["planets"].shape[-1]
+        n_gf = observation_space["global"].shape[0]
 
         self.isab_net = FullSetISABNet(
-            n_planet_features=n_planet_feat,
-            n_global_features=n_global_feat,
-            d_model=self._d_model,
-            n_heads=self._n_heads,
-            n_isab_layers=self._n_isab_layers,
-            n_inducing=self._n_inducing,
-            dropout=self._dropout,
+            n_planet_features=n_pf,
+            n_global_features=n_gf,
+            d_model=d_model,
+            n_heads=n_heads,
+            n_isab_layers=n_isab_layers,
+            n_inducing=n_inducing,
+            dropout=dropout,
         )
 
-        self.action_dist = CategoricalDistribution(int(self.action_space.n))
-        self.optimizer   = self.optimizer_class(
+        # Rebuild optimizer to include isab_net parameters
+        self.optimizer = self.optimizer_class(
             self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs
         )
 

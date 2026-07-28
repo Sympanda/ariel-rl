@@ -199,6 +199,7 @@ def build_planet_features(
     state: "MissionState",
     static_features: np.ndarray | None = None,
     per_target_events: dict[str, dict] | None = None,
+    target_ids: list[str] | None = None,
 ) -> np.ndarray:
     """Compute the full per-planet feature matrix for the current step.
 
@@ -207,26 +208,34 @@ def build_planet_features(
     state:
         Current MissionState (read-only).
     static_features:
-        Pre-computed static features from ``build_static_features``.
-        If None, they are computed on the fly (slightly slower).
+        Pre-computed static features.  Shape must be ``(N, n_static)`` where
+        N matches the number of targets being built (either ``len(target_ids)``
+        when that argument is provided, or ``len(state.targets)`` otherwise).
+        If None, static features are computed on the fly from ``state``.
     per_target_events:
         Mapping from ``target_id`` to the event dict that would be executed
-        if that planet were selected right now.  When provided, dynamic
-        timing features (capture_fraction, block_duration, slew, etc.) are
-        derived from these events — ensuring the planet token describes
-        exactly the same observation opportunity that the environment would
-        execute.  When omitted, timing is computed independently from
-        orbital parameters (fallback; used in unit tests).
+        if that planet were selected right now.
+    target_ids:
+        Optional ordered list of target IDs to build features for.  Only
+        these targets are included in the output (in this order).  Useful for
+        the dynamic active-set where completed planets have been removed.
+        When None (default), all targets in ``state.targets`` are used.
 
     Returns
     -------
-    float32 array of shape (N, N_PLANET_FEATURES).
+    float32 array of shape (N, N_PLANET_FEATURES) where N = len(target_ids)
+    if provided, else len(state.targets).
     """
     from ariel_rl.simulator.slew import slew_time_days
     from ariel_rl.data.schemas import COST_FACTOR, MISSION_LIFETIME_DAYS
 
-    targets = state.targets
-    n = len(targets)
+    if target_ids is not None:
+        target_list = target_ids
+        n = len(target_list)
+    else:
+        target_list = [str(r["target_id"]) for _, r in state.targets.iterrows()]
+        n = len(state.targets)
+
     n_static = len(STATIC_FEATURE_NAMES)
     n_dynamic = len(DYNAMIC_FEATURE_NAMES)
 
@@ -235,15 +244,27 @@ def build_planet_features(
     if static_features is not None:
         arr[:, :n_static] = static_features
     else:
-        arr[:, :n_static] = build_static_features(state)
+        # Compute static features only for the target subset
+        if target_ids is not None:
+            # Build static features for all targets first, then filter
+            all_static = build_static_features(state)
+            all_tids = [str(r["target_id"]) for _, r in state.targets.iterrows()]
+            tid_to_idx = {tid: i for i, tid in enumerate(all_tids)}
+            for j, tid in enumerate(target_list):
+                si = tid_to_idx.get(tid)
+                if si is not None:
+                    arr[j, :n_static] = all_static[si]
+        else:
+            arr[:, :n_static] = build_static_features(state)
 
     t_now = state.clock.current_time
     mission_end = state.clock.mission_end
     season_end = t_now + _SEASON_WINDOW_DAYS
 
-    for i in range(n):
-        row = targets.iloc[i]
-        tid = str(row["target_id"])
+    for i, tid in enumerate(target_list):
+        row = state._target_lookup.get(tid)
+        if row is None:
+            continue
         prog = state._progress_dict.get(tid, {})
 
         # ---- progress features ----

@@ -155,14 +155,32 @@ class ArielEnv(gym.Env):
             self._n_actions = len(self._targets)
         elif self.cfg.action.type == "full_set":
             cfg_n_max = self.cfg.action.full_set.n_max
-            # n_max=0 means "use len(targets)" (backward-compat).
-            # Otherwise use the configured cap, clamped so it is at least N.
-            self._n_actions = max(len(self._targets), cfg_n_max) if cfg_n_max > 0 else len(self._targets)
+            if cfg_n_max > 0:
+                # n_max is a hard ceiling — the catalogue must fit inside it.
+                if len(self._targets) > cfg_n_max:
+                    raise ValueError(
+                        f"Catalogue has {len(self._targets)} targets but "
+                        f"action.full_set.n_max={cfg_n_max}.  "
+                        "Increase n_max (or reduce the catalogue)."
+                    )
+                self._n_actions = cfg_n_max
+            else:
+                # n_max=0 → use catalogue size (backward-compatible default)
+                self._n_actions = len(self._targets)
         else:
             raise ValueError(f"Unknown action type: {self.cfg.action.type!r}")
 
-        # Number of actual catalogue targets (may be ≤ _n_actions when padding active)
+        # Number of actual catalogue targets (may be < _n_actions when padding active)
         self._n_targets = len(self._targets)
+
+        # Dynamic active-planet set (full_set mode only; all targets start active).
+        # Maintained as an ordered list so action_index i maps to _active_target_ids[i].
+        # Populated in reset(); updated after each step when targets complete.
+        self._active_target_ids: list[str] = []
+        # Reverse index: target_id → position in _active_target_ids (for O(1) lookup)
+        self._active_tid_to_idx: dict[str, int] = {}
+        # target_id → row-index in the full static-feature cache (built at reset)
+        self._tid_to_cache_idx: dict[str, int] = {}
 
         # ---- static per-planet feature cache (full_set mode) ----
         self._static_planet_features: np.ndarray | None = None
@@ -264,12 +282,18 @@ class ArielEnv(gym.Env):
         self._step_count = 0
         self._milestones_hit = set()
 
-        # Pre-compute static planet features (time-invariant for the episode)
-        if (
-            self.cfg.action.type == "full_set"
-            and self.cfg.action.full_set.cache_static
-        ):
-            self._static_planet_features = build_static_features(self._state)
+        if self.cfg.action.type == "full_set":
+            # Initialise dynamic active set — at reset all targets begin at tier 0
+            # so every target is active.
+            self._active_target_ids = list(self._targets["target_id"].astype(str))
+            self._active_tid_to_idx = {tid: i for i, tid in enumerate(self._active_target_ids)}
+
+            # Pre-compute static planet features (time-invariant for the episode).
+            if self.cfg.action.full_set.cache_static:
+                self._static_planet_features = build_static_features(self._state)
+                # Build reverse index: target_id → row in the (N, n_static) cache
+                all_tids = list(self._targets["target_id"].astype(str))
+                self._tid_to_cache_idx = {tid: i for i, tid in enumerate(all_tids)}
 
         # Reset relative-reward accumulators
         self._rel_interval_acc = 0.0
@@ -326,6 +350,10 @@ class ArielEnv(gym.Env):
             cfg=self.cfg.reward,
         )
         abs_reward += milestone_bonus
+
+        # Update dynamic active set: remove planets that just completed max_tier.
+        if self.cfg.action.type == "full_set":
+            self._update_active_set()
 
         # Check episode termination
         terminated = self._state.is_done()
@@ -400,22 +428,157 @@ class ArielEnv(gym.Env):
         mask = compute_mask(self._state, candidates, self.cfg.action)
         return candidates.reset_index(drop=True), mask
 
-    def _candidates_full_set(self) -> tuple[pd.DataFrame, np.ndarray]:
-        """Full-set mode: one next-event per target + padding to n_max.
+    # ------------------------------------------------------------------
+    # Dynamic active set management (full_set mode)
+    # ------------------------------------------------------------------
 
-        The candidates DataFrame has exactly ``_n_actions`` rows:
-          - rows 0 … n_targets-1: real target events (or sentinels)
-          - rows n_targets … n_max-1: zero-padded sentinels (always mask=False)
+    def _update_active_set(self) -> None:
+        """Remove targets that have reached max_tier from the active set.
 
-        This gives the ISAB policy a fixed-shape input regardless of how many
-        targets are active.
+        Called after each observation step in ``full_set`` mode.  After removal
+        the active set index is rebuilt so that ``_active_tid_to_idx`` remains
+        consistent.
         """
-        candidates, mask = self._candidates_target()
+        if not self._active_target_ids:
+            return
+        new_active: list[str] = []
+        for tid in self._active_target_ids:
+            prog   = self._state._progress_dict.get(tid)
+            target = self._state._target_lookup.get(tid)
+            if prog is None or target is None:
+                continue
+            if int(prog["current_tier"]) < int(target["max_tier"]):
+                new_active.append(tid)
+        self._active_target_ids = new_active
+        self._active_tid_to_idx = {tid: i for i, tid in enumerate(new_active)}
 
+    # ------------------------------------------------------------------
+    # Candidate selection helpers (continued)
+    # ------------------------------------------------------------------
+
+    def _candidates_full_set(self) -> tuple[pd.DataFrame, np.ndarray]:
+        """Full-set mode: one *first-reachable* event per active target + padding.
+
+        Each active planet token is associated with the first upcoming event
+        that the telescope can reach from its current position (i.e.
+        ``t_now + slew < block_end``).  If the current block has expired or
+        the slew would miss it, we look further ahead — so the agent sees a
+        real, meaningful action for every active planet rather than a
+        routinely-masked stale event.
+
+        Candidate row ordering matches ``_active_target_ids`` so that
+        ``action_index i → _active_target_ids[i]``.
+
+        Padding rows (indices ``n_active … n_max-1``) are always masked False.
+        """
+        from ariel_rl.simulator.slew import slew_time_days
+        from ariel_rl.data.schemas import COST_FACTOR
+
+        t_now    = self._state.clock.current_time
+        n_active = len(self._active_target_ids)
+
+        if n_active == 0:
+            cols = pd.Index([
+                "event_id", "target_id", "event_type",
+                "window_start", "window_mid", "window_end",
+                "duration", "duration_days", "block_duration_days", "tier_goal",
+                "base_science_value", "visibility_valid",
+                "ephemeris_uncertainty", "event_index",
+            ])
+            pad  = _make_padding_rows(self._n_actions, cols)
+            mask = np.zeros(self._n_actions, dtype=bool)
+            return pad, mask
+
+        # --- Step 1: populate the backend step-cache with a large pool ---
+        # 20× active set ensures most targets have multiple events to check.
+        pool_size = max(n_active * 20, 200)
+        pool_df   = self._backend.candidates(t_now, pool_size)
+
+        # target_id → list[event_dict] sorted chronologically (pool already sorted)
+        target_pool: dict[str, list[dict]] = {}
+        for _, ev in pool_df.iterrows():
+            tid = str(ev["target_id"])
+            target_pool.setdefault(tid, []).append(ev.to_dict())
+
+        fallback_cols = (
+            pool_df.columns
+            if len(pool_df) > 0
+            else pd.Index([
+                "event_id", "target_id", "event_type",
+                "window_start", "window_mid", "window_end",
+                "duration", "duration_days", "block_duration_days", "tier_goal",
+                "base_science_value", "visibility_valid",
+                "ephemeris_uncertainty", "event_index",
+            ])
+        )
+
+        # --- Step 2: pick first-reachable event for each active target ---
+        rows: list[dict] = []
+        for tid in self._active_target_ids:
+            target = self._state._target_lookup.get(tid)
+            if target is None:
+                rows.append(_sentinel_event(tid, fallback_cols))
+                continue
+
+            slew     = slew_time_days(
+                ra1=self._state.current_ra, dec1=self._state.current_dec,
+                ra2=float(target["ra"]),    dec2=float(target["dec"]),
+            )
+            t_arrive = t_now + slew
+
+            best_ev: dict | None = None
+
+            # --- Search the pool first (fast path) ---
+            for ev in target_pool.get(tid, []):
+                bd     = float(ev.get("block_duration_days", COST_FACTOR * ev.get("duration_days", 0.0)))
+                wm     = float(ev.get("window_mid", 0.0))
+                block_end = wm + bd / 2.0
+                if block_end > t_arrive:
+                    best_ev = ev
+                    break
+
+            # --- Fall back to backend events_for_target (long-period targets) ---
+            if best_ev is None:
+                future = self._backend.events_for_target(tid, t_now, n=20)
+                for fev in future:
+                    bd    = float(fev.get("block_duration_days", 0.0))
+                    wm    = float(fev.get("window_mid", 0.0))
+                    block_end = wm + bd / 2.0
+                    if block_end > t_arrive:
+                        # Register in step cache so execute_observation can find it
+                        eid = self._backend.register_event({**fev, "target_id": tid})
+                        if eid >= 0:
+                            best_ev = {**fev, "event_id": eid, "target_id": tid}
+                            best_ev.setdefault("tier_goal",           1)
+                            best_ev.setdefault("base_science_value",  1.0)
+                            best_ev.setdefault("visibility_valid",    True)
+                            best_ev.setdefault("ephemeris_uncertainty", 0.0)
+                            best_ev.setdefault("event_index",         -1)
+                            best_ev.setdefault("duration", best_ev.get("duration_days", 0.0) * 86400.0)
+                        break
+
+            if best_ev is not None:
+                rows.append(best_ev)
+            else:
+                # No reachable future events before mission end — sentinel
+                rows.append(_sentinel_event(tid, fallback_cols))
+
+        # --- Step 3: assemble DataFrame and compute mask ---
+        candidates = pd.DataFrame(rows)
+
+        # Ensure column ordering matches the pool schema
+        for col in fallback_cols:
+            if col not in candidates.columns:
+                candidates[col] = 0 if col != "target_id" else ""
+        candidates = candidates.reindex(columns=fallback_cols, fill_value=0)
+
+        mask = compute_mask(self._state, candidates, self.cfg.action)
+        # Padding: always False
         n_real = len(candidates)
+
+        # --- Step 4: pad to _n_actions ---
         if n_real < self._n_actions:
-            cols = candidates.columns
-            extra = _make_padding_rows(self._n_actions - n_real, cols)
+            extra = _make_padding_rows(self._n_actions - n_real, candidates.columns)
             candidates = pd.concat([candidates, extra], ignore_index=True)
             mask = np.concatenate([mask, np.zeros(self._n_actions - n_real, dtype=bool)])
 
@@ -542,21 +705,42 @@ class ArielEnv(gym.Env):
         """
         from ariel_rl.envs.observation_builder import _build_global
         if self.cfg.action.type == "full_set":
-            # Build a target_id → event dict from the pre-computed candidates so
-            # planet tokens describe exactly the event that would execute.
+            active_ids = self._active_target_ids   # ordered list; may be shorter than N_max
+
+            # Build target_id → event dict from the pre-computed candidates
+            # (candidates are in active-target order so rows 0…n_active-1 are real).
             per_target_events: dict[str, dict] | None = None
             if self._candidates is not None and len(self._candidates) > 0:
                 per_target_events = {}
-                for _, row in self._candidates.iterrows():
-                    tid = str(row["target_id"])
-                    if tid not in per_target_events:
+                for idx_row, row in self._candidates.iterrows():
+                    if idx_row >= len(active_ids):
+                        break   # padding rows have no real target
+                    tid = str(row.get("target_id", ""))
+                    if tid and tid not in per_target_events:
                         per_target_events[tid] = row.to_dict()
-            planet_arr = build_planet_features(
-                self._state,
-                self._static_planet_features,
-                per_target_events=per_target_events,
-            )
-            # Pad to _n_actions rows with zeros when n_max > n_targets
+
+            # Prepare correctly-shaped static feature slice for active targets only.
+            static_for_active: np.ndarray | None = None
+            if self._static_planet_features is not None and self._tid_to_cache_idx:
+                indices = [
+                    self._tid_to_cache_idx[tid]
+                    for tid in active_ids
+                    if tid in self._tid_to_cache_idx
+                ]
+                if indices:
+                    static_for_active = self._static_planet_features[indices]
+
+            if active_ids:
+                planet_arr = build_planet_features(
+                    self._state,
+                    static_features=static_for_active,
+                    per_target_events=per_target_events,
+                    target_ids=active_ids,
+                )
+            else:
+                planet_arr = np.zeros((0, N_PLANET_FEATURES), dtype=np.float32)
+
+            # Pad to _n_actions rows with zeros (padding positions)
             n_real = planet_arr.shape[0]
             if n_real < self._n_actions:
                 padding = np.zeros(

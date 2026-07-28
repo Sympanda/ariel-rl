@@ -102,11 +102,17 @@ class FullSetSelfAttentionNet(nn.Module):
             warnings.filterwarnings("ignore", message="enable_nested_tensor")
             self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
-        self.policy_head = nn.Linear(d_model, 1)
+        # Actor: per-token logit conditioned on both token and global mission state
+        self.global_proj_actor = nn.Linear(n_global_features, d_model)
+        self.actor_head = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, 1),
+        )
 
-        # PMA critic (same as ISAB policy — consistent comparison)
+        # PMA critic (consistent with ISAB policy for fair comparison)
         self.pma = PMA(d_model, n_heads, k=1)
-        self.global_proj = nn.Linear(n_global_features, d_model)
+        self.global_proj_critic = nn.Linear(n_global_features, d_model)
         self.value_mlp = nn.Sequential(
             nn.Linear(d_model * 2, d_model),
             nn.ReLU(),
@@ -121,7 +127,7 @@ class FullSetSelfAttentionNet(nn.Module):
                 nn.init.orthogonal_(m.weight, gain=math.sqrt(2))
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        nn.init.orthogonal_(self.policy_head.weight, gain=0.01)
+        nn.init.orthogonal_(self.actor_head[-1].weight, gain=0.01)
         nn.init.orthogonal_(self.value_mlp[-1].weight, gain=1.0)
 
     def forward(
@@ -133,10 +139,16 @@ class FullSetSelfAttentionNet(nn.Module):
         tokens = self.planet_proj(planets)                              # (B, N, d)
         tokens = self.encoder(tokens, src_key_padding_mask=padding_mask)  # (B, N, d)
 
-        logits  = self.policy_head(tokens).squeeze(-1)                  # (B, N)
-        summary = self.pma(tokens, key_padding_mask=padding_mask).squeeze(1)  # (B, d)
-        g_embed = self.global_proj(global_feat)                         # (B, d)
-        values  = self.value_mlp(th.cat([summary, g_embed], dim=-1)).squeeze(-1)
+        # Actor: per-token logit conditioned on global mission state
+        N = tokens.shape[1]
+        g_actor  = self.global_proj_actor(global_feat)                  # (B, d)
+        g_expand = g_actor.unsqueeze(1).expand(-1, N, -1)               # (B, N, d)
+        logits   = self.actor_head(th.cat([tokens, g_expand], dim=-1)).squeeze(-1)  # (B, N)
+
+        # Critic: PMA + global
+        summary  = self.pma(tokens, key_padding_mask=padding_mask).squeeze(1)  # (B, d)
+        g_critic = self.global_proj_critic(global_feat)                  # (B, d)
+        values   = self.value_mlp(th.cat([summary, g_critic], dim=-1)).squeeze(-1)
 
         return logits, values
 
@@ -166,35 +178,27 @@ class FullSetSelfAttentionPolicy(MaskableActorCriticPolicy):
         dropout: float = 0.0,
         **kwargs,
     ) -> None:
-        self._d_model  = d_model
-        self._n_heads  = n_heads
-        self._n_layers = n_layers
-        self._dropout  = dropout
-
         super().__init__(
             observation_space,
             action_space,
             lr_schedule,
-            features_extractor_class=None,
-            **{k: v for k, v in kwargs.items()
-               if k not in ("features_extractor_class",)},
+            net_arch=[],
+            **kwargs,
         )
 
-    def _build(self, lr_schedule: Schedule) -> None:
-        planet_shape  = self.observation_space["planets"].shape
-        global_shape  = self.observation_space["global"].shape
+        n_pf = observation_space["planets"].shape[-1]
+        n_gf = observation_space["global"].shape[0]
 
         self.attn_net = FullSetSelfAttentionNet(
-            n_planet_features=planet_shape[-1],
-            n_global_features=global_shape[0],
-            d_model=self._d_model,
-            n_heads=self._n_heads,
-            n_layers=self._n_layers,
-            dropout=self._dropout,
+            n_planet_features=n_pf,
+            n_global_features=n_gf,
+            d_model=d_model,
+            n_heads=n_heads,
+            n_layers=n_layers,
+            dropout=dropout,
         )
 
-        self.action_dist = CategoricalDistribution(int(self.action_space.n))
-        self.optimizer   = self.optimizer_class(
+        self.optimizer = self.optimizer_class(
             self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs
         )
 

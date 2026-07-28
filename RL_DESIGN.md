@@ -193,18 +193,31 @@ target nodes (features per target)
        └─ used_idle_fraction in global obs
 6. ── Curriculum: T1-only → full tiers  ────────────────────────  Next step
 7. ── Offline pre-training from baselines  ─────────────────────  After curriculum settled
-8. ── Full-set action space (all N targets)  ───────────────────  ✅ Done
-       └─ per-planet feature matrix (N_max × N_PLANET_FEATURES = 28) padded to N_max
-       └─ immediate action-quality features (capture_fraction, idle, slew, block_end) added
-       └─ events_for_target() on DynamicBackend — single source of truth for eclipse/either targets
-       └─ FullSetISABPolicy implemented  (ISAB × 2 + PMA critic, O(N·m) attention)
-       └─ FullSetSelfAttentionPolicy implemented  (full O(N²) ablation for comparison)
+8. ── Full-set action space (all N active targets)  ────────────  ✅ Done
+       Core invariants:
+       └─ One token = one ACTIVE planet (current_tier < max_tier)
+       └─ Completed planets are removed from the set after each step
+       └─ Explicit action_index → target_id mapping rebuilt after each removal
+       └─ N_max is a hard ceiling: n_actions = n_max exactly
+          (ValueError raised at init if len(catalogue) > n_max)
+       └─ Each token represents the first REACHABLE upcoming event (not first chronological)
+          — pools 20× the active-set size; falls back to events_for_target() + register_event()
+            for long-period targets not in the pool
+       └─ Global mission features condition both actor AND critic
+          (actor: cat([token, global_embed]) → MLP → logit)
+       Policies:
+       └─ FullSetISABPolicy  (ISAB × 2 + PMA critic, O(N·m), global actor/critic)
+       └─ FullSetSelfAttentionPolicy  (full O(N²), PMA critic, global actor/critic)
        └─ Both wired into train_agent.py (--policy full_set_isab / full_set_attention)
+       Tests (test_full_set_arch.py):
+       └─ shapes, N_max enforcement, dynamic removal, target mapping
+       └─ permutation equivariance, padding invariance, global conditioning
+       └─ PPO smoke tests for both policies
 
 Three-way comparison now possible:
-    Top-K full attention      (--policy transformer       --action-type topk)
-    Full-set full attention   (--policy full_set_attention --action-type full_set)
-    Full-set ISAB             (--policy full_set_isab      --action-type full_set)
+    Top-K full attention      (--policy transformer        --action-type topk)
+    Full-set full attention   (--policy full_set_attention  --action-type full_set)
+    Full-set ISAB             (--policy full_set_isab       --action-type full_set)
 9. ── Hierarchical or GNN extensions  ──────────────────────────  Research direction
 ```
 

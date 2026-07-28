@@ -318,18 +318,21 @@ The transformer treats each of the K candidate events as a token and uses self-a
 
 * **FullSetISABPolicy** implemented — ISAB × 2 + PMA critic, O(N·m) attention scalable to ~2000 planets.
 * **FullSetSelfAttentionPolicy** implemented — full O(N²) attention ablation for direct comparison.
-* `N_max` padding: observation space is `(N_max, 28)` with zero-pad rows; action space `Discrete(N_max)`.
-* `events_for_target()` added to `DynamicBackend` — single source of truth for eclipse/either targets.
+* **Dynamic active planet set**: completed planets are removed from the token set after each observation; only `n_active ≤ N_max` tokens participate in ISAB/PMA.  Explicit `action_index → target_id` mapping maintained.
+* **N_max is a hard ceiling**: `n_actions = n_max` exactly (not `max(len(catalogue), n_max)`).  `ValueError` raised at init if catalogue exceeds N_max.
+* **First-reachable-event semantics**: each active-planet token is associated with its first upcoming event that the telescope can reach given the current slew time — not blindly the first chronological event.  Possible-but-expensive choices are valid actions discouraged by value/reward, not masked.
+* **Global conditioning in both actor and critic**: actor logits = `MLP(cat[token, global_embedding])`, meaning mission-wide state (elapsed time, coverage, accumulated science) directly conditions action selection.
+* `events_for_target()` and `register_event()` added to `DynamicBackend` — single source of truth for event timing, including long-period fallback registration.
 * All three policies wired into `train_agent.py`:
   `--policy transformer` (Top-K), `--policy full_set_isab`, `--policy full_set_attention`.
 
 Three-way comparison:
 
-| Policy | Action space | Attention |
-|---|---|---|
-| `ArielTransformerPolicy` | Top-K events | O(K²) full |
-| `FullSetSelfAttentionPolicy` | All N planets | O(N²) full |
-| `FullSetISABPolicy` | All N planets | O(N·m) ISAB |
+| Policy | Token | Action space | Attention | Global in actor |
+|---|---|---|---|---|
+| `ArielTransformerPolicy` | candidate event | `topk` / `Discrete(K)` | O(K²) full | via CLS prepend |
+| `FullSetSelfAttentionPolicy` | active planet | `full_set` / `Discrete(N_max)` | O(N²) full | ✅ broadcast + MLP |
+| `FullSetISABPolicy` | active planet | `full_set` / `Discrete(N_max)` | O(N·m) ISAB | ✅ broadcast + MLP |
 
 ### 🔄 Phase 6: Policy improvement
 

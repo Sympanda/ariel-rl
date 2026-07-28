@@ -391,7 +391,7 @@ Wraps `MissionState` as a Gymnasium environment.  The sim and the env are **deli
 |---|---|---|
 | `topk` | `Discrete(K)` | Agent picks index 0…K-1 into the K upcoming events sorted by `window_mid`.  Default. |
 | `target` | `Discrete(N)` | Agent picks target index 0…N-1; env auto-schedules the next available event for that target |
-| `full_set` | `Discrete(N_max)` | All N targets in a fixed-size padded observation `(N_max × N_PLANET_FEATURES)`.  `N_max` is configured via `action.full_set.n_max` (default = `len(targets)`; set to 2000 for the full Ariel catalogue).  Rows beyond the real target count are zero-padded.  Three policy architectures are available: **FullSetISABPolicy** (ISAB Set Transformer, O(N·m) attention), **FullSetSelfAttentionPolicy** (full O(N²) attention ablation), and the pre-existing **ArielTransformerPolicy** (designed for top-K events but usable as a quick baseline). |
+| `full_set` | `Discrete(N_max)` | **Dynamic active planet set.** Only genuinely active targets (those with `current_tier < max_tier`) participate in ISAB/PMA attention as real tokens.  Completed targets are removed from the set after each observation.  `N_max` is a hard ceiling set via `action.full_set.n_max` (default = `len(targets)`; recommended 2000 for the full Ariel catalogue).  A `ValueError` is raised at initialisation if `len(catalogue) > N_max`.  Rows beyond `n_active` are zero-padded sentinels (always masked False).  The mapping `action_index i → _active_target_ids[i]` is maintained explicitly and rebuilt after each removal.  Each active-planet token is associated with its **first reachable upcoming event** — the first event whose block has not yet expired given the telescope's current slew time.  Possible-but-expensive choices remain valid actions; only genuinely impossible or completed targets are removed/masked.  Three policy architectures are available: **FullSetISABPolicy** (ISAB, O(N·m)), **FullSetSelfAttentionPolicy** (full O(N²) ablation), and the pre-existing **ArielTransformerPolicy** (Top-K, unchanged). |
 
 Selected via `config.action.type`.  Invalid actions are penalised with `reward = -invalid_action_penalty` (default −0.5) and do not advance the clock.
 
@@ -848,13 +848,21 @@ Action logits are clipped to `−∞` for masked positions before the softmax.
 
 Three policies are available, targeting different action spaces and computational trade-offs:
 
-| Policy | File | Action space | Observation tokens | Attention | CLI flag |
-|---|---|---|---|---|---|
-| `ArielTransformerPolicy` | `event_attention_policy.py` | `topk` | K event rows | O(K²) full | `--policy transformer` |
-| `FullSetSelfAttentionPolicy` | `full_set_attention_policy.py` | `full_set` | N_max planet rows | O(N²) full | `--policy full_set_attention` |
-| `FullSetISABPolicy` | `full_set_isab_policy.py` | `full_set` | N_max planet rows | O(N·m) ISAB | `--policy full_set_isab` |
+| Policy | File | Action space | Token = | Attention | Global in actor | CLI flag |
+|---|---|---|---|---|---|---|
+| `ArielTransformerPolicy` | `event_attention_policy.py` | `topk` | 1 candidate event | O(K²) full | via CLS prepend | `--policy transformer` |
+| `FullSetSelfAttentionPolicy` | `full_set_attention_policy.py` | `full_set` | 1 active planet | O(N²) full | ✅ broadcast + MLP | `--policy full_set_attention` |
+| `FullSetISABPolicy` | `full_set_isab_policy.py` | `full_set` | 1 active planet | O(N·m) ISAB | ✅ broadcast + MLP | `--policy full_set_isab` |
 
 The `ArielTransformerPolicy` remains the Top-K baseline — it is not replaced.
+
+**Core invariants for full_set policies:**
+1. One token = one active planet (completed planets are removed, not merely masked).
+2. An action means "slew towards this planet now."
+3. Each token's associated event is the **first reachable** opportunity (not just the nearest chronological one).
+4. Possible-but-poor choices remain as valid actions — discouraged by learned value/reward, not unnecessary masking.
+5. Padding tokens (indices `n_active … N_max-1`) are always zero-vectors and always masked False.
+6. Global mission state conditions **both actor and critic** in all full_set policies.
 
 #### `ArielTransformerPolicy` (`policies/event_attention_policy.py`)
 
@@ -880,6 +888,43 @@ Key design choices:
 - **Padding mask** derived from the SB3 action mask: invalid event slots are excluded from attention and their logits are forced to `−∞`.
 - **CLS token** seeded from the global features serves as the critic's summary of the full episode state.
 - **Orthogonal weight init** on all linear layers.
+
+#### `FullSetSelfAttentionPolicy` and `FullSetISABPolicy` (active-planet set architectures)
+
+Both policies share the same high-level structure — only the planet encoder differs.
+
+```
+obs["planets"]  (N_max × n_pf)
+  │  (rows 0…n_active-1: real active planets; rows n_active…N_max-1: zero padding)
+  │
+  ▼  planet_proj(n_pf → d_model)
+ tokens  (N_max, d_model)
+  │
+  ▼  [ISAB stack]  or  [TransformerEncoder]    — padding mask applied
+ contextualised_tokens  (N_max, d_model)
+  │
+  ├──── Actor head ─────────────────────────────────────────┐
+  │      global_proj_actor(G → d)                           │
+  │      g_expand  = broadcast to (N_max, d)                │
+  │      actor_in  = cat([token, g_expand]) → (N_max, 2d)   │
+  │      actor_head: Linear(2d→d) → ReLU → Linear(d→1)      │
+  │      logits (N_max,)  ← masked_fill(pad∪action_mask, -∞)│
+  └─────────────────────────────────────────────────────────┘
+  │
+  └──── Critic head ────────────────────────────────────────┐
+         PMA(d, n_heads, k=1): set → summary (d,)           │
+         global_proj_critic(G → d)                          │
+         critic_in = cat([summary, g_critic]) → (2d,)       │
+         value_mlp: Linear(2d→d) → ReLU → Linear(d→1)       │
+         value (1,)                                          │
+         ──────────────────────────────────────────────────-┘
+```
+
+Key differences:
+- **FullSetSelfAttentionPolicy**: uses `nn.TransformerEncoder` (O(N²)) — good ablation baseline, cheaper to implement.
+- **FullSetISABPolicy**: uses `ISAB` layers with `m` inducing points (O(N·m)) — scales to N_max ≈ 2000 without O(N²) memory cost.  PMA critic is shared.
+
+Global mission features condition both actor and critic — logits change when the global state changes even if all planet tokens are identical.
 
 ### `RLAgentWrapper` (`agents/rl_agent.py`)
 

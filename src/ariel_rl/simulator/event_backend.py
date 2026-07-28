@@ -136,6 +136,21 @@ class EventBackend(ABC):
         """
         return []
 
+    def register_event(self, event_dict: dict) -> int:
+        """Register an event dict in the per-step cache and return its event_id.
+
+        Used by ``full_set`` candidate selection to cache events from
+        ``events_for_target()`` so that ``execute_observation`` can look them
+        up via ``get_event(event_id)``.
+
+        For ``TableBackend`` events are stable so no registration is needed —
+        the default implementation returns the existing ``event_id`` unchanged.
+        For ``DynamicBackend`` the event is written into ``_event_cache``.
+
+        Returns -1 if registration fails (e.g. unknown target).
+        """
+        return int(event_dict.get("event_id", -1))
+
 
 # ---------------------------------------------------------------------------
 # TableBackend
@@ -455,6 +470,36 @@ class DynamicBackend(EventBackend):
                 "candidates() must be called before get_event() each step."
             )
         return pd.Series(self._event_cache[event_id])
+
+    def register_event(self, event_dict: dict) -> int:
+        """Register an event from ``events_for_target`` in the step cache.
+
+        Assigns the canonical event_id for this target/event_type combination
+        (``target_idx * 2`` for transit, ``* 2 + 1`` for eclipse), overwrites
+        any existing cache entry for that ID, and returns the id.
+
+        This allows ``full_set`` candidate selection to cache events that were
+        not included in the top-K ``candidates()`` pool (e.g. long-period targets
+        whose next occurrence is far in the future) so that
+        ``execute_observation`` can look them up via ``get_event``.
+        """
+        target_id = str(event_dict.get("target_id", ""))
+        idx = self._tid_to_idx.get(target_id)
+        if idx is None:
+            return -1
+        etype = str(event_dict.get("event_type", "transit"))
+        eid = idx * 2 if etype == "transit" else idx * 2 + 1
+        # Store a complete record (with event_id set correctly)
+        cached = {**event_dict, "event_id": eid}
+        # Fill in any fields that execute_observation might need
+        cached.setdefault("tier_goal",              self._tier_goals[idx])
+        cached.setdefault("base_science_value",     1.0)
+        cached.setdefault("visibility_valid",        True)
+        cached.setdefault("ephemeris_uncertainty",   0.0)
+        cached.setdefault("event_index",             -1)
+        cached.setdefault("duration", cached.get("duration_days", 0.0) * 86400.0)
+        self._event_cache[eid] = cached
+        return eid
 
     def events_for_target(
         self,
