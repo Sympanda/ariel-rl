@@ -140,9 +140,9 @@ def post_training_plots(
     model,
     cfg,
     targets,
-    events,
     out_dir: Path,
     run_name: str,
+    events=None,   # unused — retained for backward-compat
     n_eval_episodes: int = 3,
     seed: int = 0,
 ) -> None:
@@ -221,7 +221,7 @@ def post_training_plots(
     # ── 2. Eval episodes via RLAgentWrapper ───────────────────────────────────
     print(f"\nRunning {n_eval_episodes} evaluation episode(s) …")
     agent = RLAgentWrapper(model, deterministic=True, name=run_name)
-    env   = ArielEnv(cfg, targets=targets, events=events)
+    env   = ArielEnv(cfg, targets=targets)
 
     all_stats, reward_logs = [], {}
 
@@ -344,8 +344,7 @@ def main() -> None:
     from ariel_rl.agents.policies.event_attention_policy import ArielTransformerPolicy
     from ariel_rl.agents.policies.mlp_scorer import ArielMlpPolicy
     from ariel_rl.data.preprocess_targets import build_target_table
-    from ariel_rl.simulator.event_generator import generate_events
-    from ariel_rl.utils.config import default_env_config, load_env_config
+    from ariel_rl.utils.config import default_env_config, load_env_config, env_config_to_dict
 
     # ---- device selection ----
     if args.device == "auto":
@@ -390,20 +389,28 @@ def main() -> None:
     print(f"  max_tier_cap     = {cfg.mission.max_tier_cap}")
 
     # ---- pre-build shared tables ----
-    print("\nBuilding shared target + event tables …")
+    print("\nBuilding shared target table …")
     targets = build_target_table(args.csv_path)
-    events  = generate_events(
-        targets,
-        mission_start=cfg.mission.start_bjd,
-        mission_end=cfg.mission.start_bjd + cfg.mission.lifetime_days,
-    )
-    print(f"  {len(targets)} targets, {len(events):,} events")
+    print(f"  {len(targets)} targets  (DynamicBackend — no event table needed)")
+
+    # ---- output dirs ----
+    out_dir = Path("outputs") / args.run_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- save reward config snapshot alongside this run ----
+    import yaml as _yaml
+    from ariel_rl.utils.config import env_config_to_dict
+    _reward_snapshot_path = out_dir / "reward_config.yaml"
+    _reward_dict = env_config_to_dict(cfg).get("reward", {})
+    with open(_reward_snapshot_path, "w") as _f:
+        _yaml.dump({"reward": _reward_dict}, _f, default_flow_style=False, sort_keys=True)
+    print(f"Reward : config snapshot saved → {_reward_snapshot_path}")
 
     # ---- environments ----
     print(f"\nCreating {args.n_envs} parallel environment(s) …")
     env = make_training_envs(
         cfg, n_envs=args.n_envs, seed=args.seed,
-        targets=targets, events=events,
+        targets=targets,
     )
 
     # ---- policy ----
@@ -423,10 +430,6 @@ def main() -> None:
         policy_cls = ArielMlpPolicy
         policy_kwargs = {"hidden_sizes": args.hidden_sizes}
         policy_desc = f"ArielMlpPolicy (hidden={args.hidden_sizes})"
-
-    # ---- output dirs ----
-    out_dir = Path("outputs") / args.run_name
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- model ----
     print(f"\nPolicy : {policy_desc}")
@@ -516,7 +519,6 @@ def main() -> None:
         model=model,
         cfg=cfg,
         targets=targets,
-        events=events,
         out_dir=out_dir,
         run_name=args.run_name,
         n_eval_episodes=3,

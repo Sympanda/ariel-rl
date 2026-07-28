@@ -37,6 +37,11 @@ from ariel_rl.data.schemas import (
     TIER_3,
     TIER_NONE,
 )
+# COST_FACTOR = 2.5 — the authoritative observation block multiplier:
+#   block_duration_days = COST_FACTOR * T14_days
+# Every observation block includes:
+#   (COST_FACTOR/2 - 0.5) * T14 pre-baseline  +  T14 transit  +  (COST_FACTOR/2 - 0.5) * T14 post-baseline
+# = 0.75 * T14  +  T14  +  0.75 * T14  =  2.5 * T14
 from ariel_rl.simulator.mission_clock import MissionClock
 from ariel_rl.simulator.slew import slew_time_days
 
@@ -89,8 +94,15 @@ class MissionState:
             row["target_id"]: row for _, row in self.targets.iterrows()
         }
         if self._backend is None:
-            from ariel_rl.simulator.event_backend import TableBackend
-            self._backend = TableBackend(self.events)
+            # If we were given a non-empty events table, wrap it in a
+            # TableBackend (e.g. from from_tables or legacy test helpers).
+            # Otherwise default to DynamicBackend.
+            if len(self.events) > 0:
+                from ariel_rl.simulator.event_backend import TableBackend
+                self._backend = TableBackend(self.events)
+            else:
+                from ariel_rl.simulator.event_backend import DynamicBackend
+                self._backend = DynamicBackend(self.targets)
         max_t3 = self.targets["tier3_required_obs"].max()
         self._max_obs_rem_val = int(max_t3) if pd.notna(max_t3) else 1
         # Plain-dict cache for progress rows — much faster than progress.loc
@@ -177,27 +189,48 @@ class MissionState:
     ) -> dict:
         """Execute the observation for the given event_id.
 
-        Advances the clock by (slew + obs_duration).
-        Updates target progress.
-        Returns an info dict.
+        Timing and partial-observation model
+        --------------------------------------
+        The telescope slews *immediately* after the action is chosen.  The
+        clock advances as:
+
+            slew  →  idle (wait for block_start if arrived early)  →  observe
+
+        where:
+            block_duration_days = COST_FACTOR * T14_days  (= 2.5 × T14)
+            block_start         = window_mid − block_duration_days / 2
+            block_end           = window_mid + block_duration_days / 2
+
+        Three cases are handled:
+          Case A  t_arrive ≤ block_start   : full block, captured_fraction = 1.0
+          Case B  block_start < t_arrive < block_end
+                                           : partial block,
+                                             captured_fraction = (block_end − t_arrive)
+                                                                 / block_duration_days
+          Case C  t_arrive ≥ block_end     : complete miss, only slew cost paid
+
+        A partial capture still contributes fractional progress to obs_completed
+        so the agent is never penalised for arriving slightly late.
 
         Parameters
         ----------
         event_id:
-            Row in ``self.events`` to observe.
+            Identifier returned by the active ``EventBackend``.
 
         Returns
         -------
         dict with keys:
-            target_id, event_type, obs_duration_days, slew_days,
-            total_cost_days, tier_before, tier_after, tier_completed,
-            obs_number, missed (bool — arrived after window_end)
+            target_id, event_type, block_duration_days, slew_days, idle_days,
+            obs_duration_days, total_cost_days, captured_fraction,
+            tier_before, tier_after, tier_completed,
+            obs_number, missed (bool), progress_before, progress_after,
+            science_weight, population_bin, period, host_id
         """
         event = self._backend.get_event(event_id)
         target_id = event["target_id"]
         target = self._target_lookup[target_id]
 
-        # ---- slew ----
+        # ---- Slew: starts immediately from current pointing ----
         slew_days = slew_time_days(
             ra1=self.current_ra,
             dec1=self.current_dec,
@@ -205,74 +238,119 @@ class MissionState:
             dec2=float(target["dec"]),
         )
 
-        # ---- check if we need to wait for window_start ----
-        window_start = float(event["window_start"])
-        if self.clock.current_time < window_start:
-            # Jump ahead to window start (idle wait)
-            self.clock.skip_to(window_start)
+        t_arrive = self.clock.current_time + slew_days
 
-        # ---- check if we've missed the window ----
-        window_end = float(event["window_end"])
-        missed = (self.clock.current_time + slew_days) > window_end
+        # ---- Observation block geometry ----
+        # block_duration_days is stored on the event by DynamicBackend;
+        # fall back to COST_FACTOR * duration_days for legacy TableBackend rows.
+        block_duration_days = float(
+            event["block_duration_days"]
+            if "block_duration_days" in event.index
+            else COST_FACTOR * event["duration_days"]
+        )
+        window_mid  = float(event["window_mid"])
+        block_start = window_mid - block_duration_days / 2.0
+        block_end   = window_mid + block_duration_days / 2.0  # observation block ends here
 
-        obs_duration_days = float(event["duration_days"])
+        # ---- Partial observation model ----
+        # The observation block extends beyond the raw transit/eclipse window:
+        #
+        #   block_start ←—(0.75 × T14 baseline)—→ transit ←—(0.75 × T14 baseline)—→ block_end
+        #
+        # Three cases:
+        #   Case A  (t_arrive ≤ block_start):  full block captured  → fraction = 1.0
+        #   Case B  (block_start < t_arrive < block_end):
+        #               partial block captured → fraction = (block_end − t_arrive) / block_duration
+        #   Case C  (t_arrive ≥ block_end):    no useful data        → missed = True
+        #
+        # A partial observation still advances science progress — it contributes
+        # a fraction of one equivalent observation to obs_completed.
 
-        tier_before   = int(self._progress_dict[target_id]["current_tier"])
+        if t_arrive >= block_end:
+            captured_fraction = 0.0
+            missed = True
+        elif t_arrive <= block_start:
+            captured_fraction = 1.0
+            missed = False
+        else:
+            captured_fraction = (block_end - t_arrive) / block_duration_days
+            missed = False
+
+        tier_before    = int(self._progress_dict[target_id]["current_tier"])
         progress_before = float(self._progress_dict[target_id]["progress_in_tier"])
 
         if missed:
             self.clock.record_miss()
-            # Still pay the slew cost so the clock advances
+            # Pay only the slew; no science, no idle wait.
             self.clock.advance(obs_duration_days=0.0, slew_days=slew_days)
+            idle_days = 0.0
+            obs_duration_days = 0.0
         else:
-            # Pay slew then observation
-            self.clock.advance(obs_duration_days=obs_duration_days, slew_days=slew_days)
-            # Update pointing
-            self.current_ra = float(target["ra"])
+            # ---- Idle: arrived before block_start → wait ----
+            idle_days = max(0.0, block_start - t_arrive)
+
+            # ---- Observation duration = captured portion of the block ----
+            # For a full capture (fraction=1.0) this equals block_duration_days.
+            # For a partial capture the clock advances by only the remaining
+            # portion, so telescope time is not "wasted" on the elapsed part.
+            obs_duration_days = captured_fraction * block_duration_days
+
+            self.clock.advance(
+                obs_duration_days=obs_duration_days,
+                slew_days=slew_days,
+                idle_days=idle_days,
+            )
+            self.current_ra  = float(target["ra"])
             self.current_dec = float(target["dec"])
-            # Update progress
-            self._increment_progress(target_id, target)
+            self._increment_progress(target_id, target, captured_fraction)
 
         tier_after    = int(self._progress_dict[target_id]["current_tier"])
         progress_after = float(self._progress_dict[target_id]["progress_in_tier"])
 
+        total_cost_days = slew_days + idle_days + obs_duration_days
+
         info = {
-            "target_id":         target_id,
-            "event_id":          event_id,
-            "event_type":        event["event_type"],
-            "obs_duration_days": obs_duration_days,
-            "slew_days":         slew_days,
-            "total_cost_days":   obs_duration_days + slew_days,
-            "tier_before":       tier_before,
-            "tier_after":        tier_after,
-            "tier_completed":    tier_after > tier_before,
-            "obs_number":        int(self._progress_dict[target_id]["obs_completed"]),
-            "missed":            missed,
-            # Additional context consumed by the reward function:
-            "progress_before":   progress_before,
-            "progress_after":    progress_after,
-            "science_weight":    float(target.get("science_weight", 0.5)),
-            "population_bin":    str(target.get("population_bin", "")),
-            # Orbital period (days) — used by the rarity bonus in compute_reward.
-            "period":            float(target.get("period", 0.0)),
+            "target_id":           target_id,
+            "event_id":            event_id,
+            "event_type":          event["event_type"],
+            "block_duration_days": block_duration_days,
+            "obs_duration_days":   obs_duration_days,
+            "captured_fraction":   captured_fraction,
+            "slew_days":           slew_days,
+            "idle_days":           idle_days,
+            "total_cost_days":     total_cost_days,
+            "tier_before":         tier_before,
+            "tier_after":          tier_after,
+            "tier_completed":      tier_after > tier_before,
+            "obs_number":          float(self._progress_dict[target_id]["obs_completed"]),
+            "missed":              missed,
+            "progress_before":     progress_before,
+            "progress_after":      progress_after,
+            "science_weight":      float(target.get("science_weight", 0.5)),
+            "population_bin":      str(target.get("population_bin", "")),
+            "period":              float(target.get("period", 0.0)),
+            "host_id":             str(target.get("host_id", "")),
         }
 
         # Append to observation log (used for Gantt / diagnostic plots)
         self.obs_log.append({
-            "step":              len(self.obs_log),
-            "mission_day":       float(event["window_mid"]) - self.clock.mission_start,
-            "target_id":         target_id,
-            "event_type":        str(event["event_type"]),
-            "window_mid":        float(event["window_mid"]),
-            "obs_duration_days": obs_duration_days,
-            "slew_days":         slew_days,
-            "tier_before":       tier_before,
-            "tier_after":        tier_after,
-            "missed":            missed,
-            "population_bin":    str(target.get("population_bin", "")),
-            "science_weight":    float(target.get("science_weight", 0.0)),
-            "ra":                float(target.get("ra", 0.0)),
-            "dec":               float(target.get("dec", 0.0)),
+            "step":                len(self.obs_log),
+            "mission_day":         window_mid - self.clock.mission_start,
+            "target_id":           target_id,
+            "event_type":          str(event["event_type"]),
+            "window_mid":          window_mid,
+            "block_duration_days": block_duration_days,
+            "obs_duration_days":   obs_duration_days,
+            "captured_fraction":   captured_fraction,
+            "slew_days":           slew_days,
+            "idle_days":           idle_days,
+            "tier_before":         tier_before,
+            "tier_after":          tier_after,
+            "missed":              missed,
+            "population_bin":      str(target.get("population_bin", "")),
+            "science_weight":      float(target.get("science_weight", 0.0)),
+            "ra":                  float(target.get("ra", 0.0)),
+            "dec":                 float(target.get("dec", 0.0)),
         })
 
         return info
@@ -281,9 +359,20 @@ class MissionState:
     # Progress helpers
     # ------------------------------------------------------------------
 
-    def _increment_progress(self, target_id: str, target: pd.Series) -> None:
-        old_completed = int(self._progress_dict[target_id]["obs_completed"])
-        new_completed = old_completed + 1
+    def _increment_progress(
+        self,
+        target_id: str,
+        target: pd.Series,
+        captured_fraction: float = 1.0,
+    ) -> None:
+        """Advance obs_completed by captured_fraction (1.0 for a full observation).
+
+        Partial observations (0 < fraction < 1) accumulate fractional progress;
+        tier thresholds are crossed when obs_completed first meets an integer
+        tier requirement.
+        """
+        old_completed = float(self._progress_dict[target_id]["obs_completed"])
+        new_completed = old_completed + captured_fraction
         new_state = compute_progress(new_completed, target)
         # Update both the fast dict and the backing DataFrame.
         self._progress_dict[target_id].update(new_state)
@@ -389,7 +478,8 @@ class MissionState:
         if not self.obs_log:
             return pd.DataFrame(columns=[
                 "step", "mission_day", "target_id", "event_type",
-                "window_mid", "obs_duration_days", "slew_days",
+                "window_mid", "block_duration_days", "obs_duration_days",
+                "captured_fraction", "slew_days", "idle_days",
                 "tier_before", "tier_after", "missed",
                 "population_bin", "science_weight", "ra", "dec",
             ])

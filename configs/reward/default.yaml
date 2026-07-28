@@ -1,0 +1,93 @@
+# Default reward configuration for Ariel RL.
+#
+# This is the single authoritative reward preset.  All training runs should
+# start from this file.  A copy is automatically saved to
+# outputs/<run_name>/reward_config.yaml at training start so that any run
+# can be exactly reproduced or used as a contrastive-RL baseline.
+#
+# Component summary
+# -----------------
+# Science signal (sparse / dense):
+#   tier{1,2,3}_completion  — one-shot bonus when a tier boundary is crossed
+#   progress_weight         — dense shaping toward tier completion
+#   coverage_weight         — marginal U_pop signal when a new bin slot is filled
+#
+# Diversity / host structure:
+#   diversity_multiplier_max — scales tier/progress rewards for unseen bins
+#   unique_host_weight       — bonus for the first T1 in a new stellar system
+#   comparative_weight       — bonus for comparative-planetology siblings
+#
+# Science weight floor:
+#   science_weight_floor     — prevents most-common bin getting weight 0
+#
+# Time efficiency:
+#   efficiency_weight        — obs_block / (slew + idle + block); penalises waste
+#   idle_penalty_per_day     — per-day cost for waiting before a block starts
+#
+# Rarity:
+#   rarity_weight            — bonus for hard-to-catch long-period targets
+#
+# Coverage milestones / terminal:
+#   t1_milestone_*           — one-shot bonuses at T1 coverage thresholds
+#   t1_terminal_*            — end-of-episode bonus (quadratic in T1 fraction)
+#
+# Penalties:
+#   miss_penalty             — arrived after window_end
+#   invalid_action_penalty   — chose a masked action
+
+reward:
+  # ---- sparse tier completion ----
+  tier1_completion:           3.0
+  tier2_completion:           10.0
+  tier3_completion:           30.0
+
+  # ---- dense progress shaping ----
+  progress_weight:            0.05
+  near_completion_threshold:  0.7
+  near_completion_scale:      3.0
+
+  # ---- diversity multiplier (scales tier + progress by bin coverage) ----
+  diversity_multiplier_max:   5.0
+
+  # ---- coverage potential U_pop (marginal, fires on T1 completion) ----
+  coverage_quota_per_bin:     5
+  coverage_weight:            2.0
+
+  # ---- science weight floor ----
+  science_weight_floor:       0.3
+
+  # ---- time efficiency ----
+  efficiency_weight:          0.0      # implicit via total_cost in obs_block/total
+  idle_penalty_per_day:       0.005
+
+  # ---- host diversity ----
+  unique_host_weight:         0.5
+  comparative_weight:         0.3
+
+  # ---- rarity / long-period difficulty ----
+  rarity_weight:              0.5
+  rarity_period_ref_days:     365.0
+
+  # ---- coverage milestones (one-shot per episode) ----
+  t1_milestone_fractions:     [0.25, 0.5, 0.75, 0.90, 1.0]
+  t1_milestone_bonus:         50.0
+
+  # ---- terminal episode bonus ----
+  t1_terminal_weight:         300.0
+  t1_terminal_power:          2.0
+
+  # ---- random-baseline subtraction (off by default) ----
+  subtract_random_baseline:   false
+  random_baseline_per_step:   4.0
+
+  # ---- penalties ----
+  miss_penalty:               0.1
+  invalid_action_penalty:     0.5
+
+  # ---- reward mode ----
+  reward_mode:                absolute
+  comparison_interval_days:   7.0
+  compound_interval_days:     28.0
+  comparison_scale:           1.0
+  compound_scale:             0.1
+  baseline_trajectory_path:   ""

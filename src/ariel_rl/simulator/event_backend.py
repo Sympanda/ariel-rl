@@ -57,7 +57,7 @@ import pandas as pd
 EVENT_COLUMNS: list[str] = [
     "event_id", "target_id", "event_type",
     "window_start", "window_mid", "window_end",
-    "duration", "duration_days", "tier_goal",
+    "duration", "duration_days", "block_duration_days", "tier_goal",
     "base_science_value", "visibility_valid",
     "ephemeris_uncertainty", "event_index",
 ]
@@ -112,6 +112,12 @@ class EventBackend(ABC):
 
 class TableBackend(EventBackend):
     """Backend backed by a pre-computed events DataFrame.
+
+    .. deprecated::
+        Use :class:`DynamicBackend` instead.  ``TableBackend`` requires a
+        pre-generated event table (``generate_events.py``) and does not
+        populate the ``block_duration_days`` column added in Phase 1b.
+        It is kept for backward-compatibility only and will be removed.
 
     Wraps all of the optimised access patterns previously embedded directly in
     ``MissionState`` and ``ArielEnv._candidates_topk``:
@@ -200,7 +206,8 @@ class DynamicBackend(EventBackend):
 
     def __init__(self, targets: pd.DataFrame) -> None:
         from ariel_rl.simulator.event_generator import _base_science_value
-        from ariel_rl.data.schemas import METHOD_ECLIPSE, METHOD_EITHER
+        from ariel_rl.data.schemas import METHOD_ECLIPSE, METHOD_EITHER, COST_FACTOR
+        self._cost_factor: float = COST_FACTOR
 
         n = len(targets)
         self._target_ids: np.ndarray = targets["target_id"].to_numpy()
@@ -306,6 +313,7 @@ class DynamicBackend(EventBackend):
                 eid  = i * 2
                 half = self._half_tr[i]
                 mid  = tr_center[i]
+                dur_days = self._tr_dur_days[i]
                 rec  = {
                     "event_id":              eid,
                     "target_id":             self._target_ids[i],
@@ -314,7 +322,8 @@ class DynamicBackend(EventBackend):
                     "window_mid":            mid,
                     "window_end":            mid + half,
                     "duration":              self._tr_dur_s[i],
-                    "duration_days":         self._tr_dur_days[i],
+                    "duration_days":         dur_days,
+                    "block_duration_days":   self._cost_factor * dur_days,
                     "tier_goal":             int(self._tier_goals[i]),
                     "base_science_value":    float(self._bsv_tr[i]),
                     "visibility_valid":      True,
@@ -327,6 +336,7 @@ class DynamicBackend(EventBackend):
                 eid  = i * 2 + 1
                 half = self._half_ec[i]
                 mid  = ec_center[i]
+                dur_days = self._ec_dur_days[i]
                 rec  = {
                     "event_id":              eid,
                     "target_id":             self._target_ids[i],
@@ -335,7 +345,8 @@ class DynamicBackend(EventBackend):
                     "window_mid":            mid,
                     "window_end":            mid + half,
                     "duration":              self._ec_dur_s[i],
-                    "duration_days":         self._ec_dur_days[i],
+                    "duration_days":         dur_days,
+                    "block_duration_days":   self._cost_factor * dur_days,
                     "tier_goal":             int(self._tier_goals[i]),
                     "base_science_value":    float(self._bsv_ec[i]),
                     "visibility_valid":      True,

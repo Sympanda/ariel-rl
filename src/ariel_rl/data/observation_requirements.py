@@ -65,13 +65,17 @@ def add_observation_costs(targets: pd.DataFrame) -> pd.DataFrame:
 # Progress computation  (called during episode, not just at startup)
 # ---------------------------------------------------------------------------
 
-def compute_progress(obs_completed: int, target_row: pd.Series) -> dict:
+def compute_progress(obs_completed: float, target_row: pd.Series) -> dict:
     """Compute tier progress state for a single target given obs_completed.
 
     Parameters
     ----------
     obs_completed:
-        Number of observations executed so far for this target.
+        Equivalent observations executed so far for this target.  This is a
+        *float* to support partial-observation credit (e.g. 0.6 equivalent obs
+        when the telescope arrives mid-block and captures 60 % of the window).
+        Tier thresholds are still integers; progress crosses a tier boundary
+        when ``obs_completed`` first meets or exceeds the threshold.
     target_row:
         A row from the processed target DataFrame (must have
         tier1_required_obs, tier2_required_obs, tier3_required_obs, max_tier).
@@ -140,11 +144,11 @@ def initialise_progress_table(targets: pd.DataFrame) -> pd.DataFrame:
     Returns
     -------
     pd.DataFrame
-        One row per target, all obs_completed=0, current_tier=0.
+        One row per target, all obs_completed=0.0, current_tier=0.
     """
     rows = []
     for _, row in targets.iterrows():
-        p = compute_progress(0, row)
+        p = compute_progress(0.0, row)
         p["target_id"] = row["target_id"]
         p["max_tier"] = int(row["max_tier"]) if pd.notna(row["max_tier"]) else 1
         rows.append(p)

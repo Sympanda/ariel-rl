@@ -138,19 +138,20 @@ TARGET_DTYPES: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 EVENT_COLS = [
-    "event_id",             # int   — unique sequential id
-    "target_id",            # str   — foreign key → target table
-    "event_type",           # str   — "transit" / "eclipse"
-    "window_start",         # float — BJD, start of observable window
-    "window_mid",           # float — BJD, predicted mid-time
-    "window_end",           # float — BJD, end of observable window
-    "duration",             # float — seconds (observation duration = T14 or E14)
-    "duration_days",        # float — days (convenience)
-    "tier_goal",            # int   — tier this observation is counted toward
-    "base_science_value",   # float — 0–1, intrinsic value before context
-    "visibility_valid",     # bool  — within satellite pointing constraints
-    "ephemeris_uncertainty",# float — seconds, 1-sigma timing uncertainty at event
-    "event_index",          # int   — transit/eclipse number (0-based from epoch)
+    "event_id",              # int   — unique sequential id
+    "target_id",             # str   — foreign key → target table
+    "event_type",            # str   — "transit" / "eclipse"
+    "window_start",          # float — BJD, start of transit/eclipse (mid − T14/2)
+    "window_mid",            # float — BJD, predicted mid-time
+    "window_end",            # float — BJD, end of transit/eclipse (mid + T14/2)
+    "duration",              # float — seconds (raw T14 or E14)
+    "duration_days",         # float — days (raw T14 or E14, for SNR purposes)
+    "block_duration_days",   # float — full observation block = COST_FACTOR * duration_days
+    "tier_goal",             # int   — tier this observation is counted toward
+    "base_science_value",    # float — 0–1, intrinsic value before context
+    "visibility_valid",      # bool  — within satellite pointing constraints
+    "ephemeris_uncertainty", # float — seconds, 1-sigma timing uncertainty at event
+    "event_index",           # int   — transit/eclipse number (0-based from epoch)
 ]
 
 EVENT_DTYPES: dict[str, str] = {
@@ -162,6 +163,7 @@ EVENT_DTYPES: dict[str, str] = {
     "window_end":            "float64",
     "duration":              "float64",
     "duration_days":         "float64",
+    "block_duration_days":   "float64",
     "tier_goal":             "Int64",
     "base_science_value":    "float64",
     "visibility_valid":      "bool",
@@ -175,25 +177,25 @@ EVENT_DTYPES: dict[str, str] = {
 
 PROGRESS_COLS = [
     "target_id",             # str   — primary key
-    "obs_completed",         # int   — total observations executed so far
+    "obs_completed",         # float — equivalent observations executed (fractional with partial obs)
     "current_tier",          # int   — highest completed tier (0 = none)
     "tier1_done",            # bool
     "tier2_done",            # bool
     "tier3_done",            # bool
     "progress_in_tier",      # float — 0–1, fraction toward next tier
-    "obs_remaining_next_tier",# int   — observations to reach next tier (0 if maxed)
+    "obs_remaining_next_tier",# float — equivalent obs to reach next tier (0 if maxed; fractional)
     "max_tier",              # int   — copy from target table for convenience
 ]
 
 PROGRESS_DTYPES: dict[str, str] = {
     "target_id":              "string",
-    "obs_completed":          "int64",
+    "obs_completed":          "float64",
     "current_tier":           "int64",
     "tier1_done":             "bool",
     "tier2_done":             "bool",
     "tier3_done":             "bool",
     "progress_in_tier":       "float64",
-    "obs_remaining_next_tier":"int64",
+    "obs_remaining_next_tier":"float64",
     "max_tier":               "int64",
 }
 

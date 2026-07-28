@@ -18,16 +18,19 @@ The hard part is that decisions interact over time: choosing target A now might 
 
 ## Idea 1 — Attention / Pointer Network (set-to-action)
 
-**What it is:** Each of the *k* candidate events is a token.  A transformer encoder runs self-attention across tokens so candidates can see each other.  A cross-attention decoder uses the global mission state as a query to score each token.  The action is the argmax (or sample) of the resulting logit vector.
+**What it is:** Each of the *k* candidate events is a token.  A transformer encoder runs self-attention across tokens so candidates can see each other.  A CLS token seeded from the global mission state serves as the critic input and as a query over the event tokens.  The action is the argmax (or sample) of the resulting logit vector.
 
 ```
-global (64,) ──► linear ──► context (128,)
-                                  │
-events (k×16) ──► linear ──► token embeddings (k×128)
-              ──► Transformer encoder (N layers)
-              ──► cross-attention with context
-              ──► score per token (k,)
-              ──► mask invalid ──► softmax ──► π(a|s)
+global (G=26,) ──► linear ──► CLS token (d_model)
+                                    │
+events (K×17)  ──► linear ──► token embeddings (K×d_model)
+               ──► [CLS | e_1 | … | e_K]
+               ──► Transformer encoder (Pre-LN, n_layers, n_heads)
+                        ┌──────────────┴──────────────┐
+                   tokens[1:]                     tokens[0]  (CLS)
+                policy_head(K,)               value_head(1,)
+             (per-token logits)              (scalar value)
+               ──► mask invalid ──► softmax ──► π(a|s)
 ```
 
 **Why it fits this problem:**
@@ -47,7 +50,7 @@ events (k×16) ──► linear ──► token embeddings (k×128)
 
 ## Idea 2 — Plain MLP Baseline (flatten events)
 
-**What it is:** Flatten the `events (k×16)` array → concatenate with `global (64,)` → standard MLP → logits.  Standard SB3 `MlpPolicy` with a custom feature extractor.
+**What it is:** Flatten the `events (K×17)` array → concatenate with `global (26,)` → standard MLP → logits.  Standard SB3 `MlpPolicy` with a custom feature extractor.
 
 **Why it's worth doing first:**
 - Takes an afternoon to implement.
@@ -172,15 +175,26 @@ target nodes (features per target)
        └─ Established training loop, SB3 CSV logger, post-training plots
        └─ Confirmed it does NOT beat RandomValid — reward dominated by dense shaping,
           not sparse tier completions; validates that architecture matters
-3. ── Attention / Transformer policy (Idea 1)  ─────────────────  ✅ Done (transformer_v1, 3M steps)
+3. ── Attention / Transformer policy (Idea 1)  ─────────────────  ✅ Done (transformer_v1/v3, 3M steps)
        └─ Beats all baselines on science efficiency (+10 % over best greedy on 1Y run)
        └─ Matches T1/T2/T3 completion counts with top baselines
        └─ Highest T1 and T3 completion on 1Y run
-       └─ Coverage gap: 0.88 vs 1.0 for 3 baselines — see notes below
-4. ── Reward reshaping to fix coverage gap  ────────────────────  In progress (see below)
-5. ── Curriculum: T1-only → full tiers  ────────────────────────  Planned
-6. ── Offline pre-training from baselines  ─────────────────────  After reward is settled
-7. ── Hierarchical or GNN extensions  ──────────────────────────  Research direction
+       └─ Coverage gap: 0.88 vs 1.0 for 3 baselines — fixed in reward redesign
+4. ── Reward redesign  ─────────────────────────────────────────  ✅ Done
+       └─ Coverage potential U_pop, unique-host, comparative-planetology bonuses
+       └─ Science weight floor (prevents zero-weight bins)
+       └─ Diversity multiplier max 5× (was 2×)
+       └─ Idle-time penalty; 2.5×T14 block duration enforced consistently
+       └─ Reward config saved per run for reproducibility
+5. ── Scheduling dynamics overhaul  ────────────────────────────  ✅ Done
+       └─ Slew immediately, then idle, then observe
+       └─ DynamicBackend as default (no pre-computed event table)
+       └─ block_duration_days in event schema and observation features
+       └─ used_idle_fraction in global obs
+6. ── Curriculum: T1-only → full tiers  ────────────────────────  Next step
+7. ── Offline pre-training from baselines  ─────────────────────  After curriculum settled
+8. ── Full-set action space (all N targets)  ───────────────────  Partially implemented (full_set mode)
+9. ── Hierarchical or GNN extensions  ──────────────────────────  Research direction
 ```
 
 ---
@@ -273,4 +287,4 @@ This is one of the strongest practical arguments for the transformer over MLP fo
 
 ---
 
-*Last updated: June 2026*
+*Last updated: July 2026*

@@ -4,7 +4,7 @@ numpy arrays the agent actually sees.
 
 The observation is a dict with two arrays:
 
-  "events"  : float32 array of shape (K, 16)
+  "events"  : float32 array of shape (K, 18)
               One row per candidate event, in candidate order.  Rows beyond
               the number of real events are zero-padded (corresponding to
               invalid / masked actions).
@@ -50,8 +50,10 @@ if TYPE_CHECKING:
 _NORM = {
     # event-level
     "slew_time_days":               2.0 / 24,   # 2-hr slew cap in days
-    "duration_days":                1.0,         # T14 ≤ 1 day
-    "total_time_cost_days":         1.0,         # slew + obs; both ≤ 1 day each
+    "duration_days":                1.0,         # raw T14 ≤ 1 day
+    "block_duration_days":          1.0,         # 2.5 × T14 ≤ ~2.5 days; clip keeps in [0,1]
+    "total_time_cost_days":         3.0,         # slew + idle + block; max ~3 days
+    "capture_fraction":             1.0,         # already in [0, 1]
     "obs_remaining_next_tier_norm": 1.0,         # already normalised
     "days_to_window_end_norm":      2.0,         # window end within ~2-day lookahead for k=50
     "planet_radius_norm":           20.0,        # Re (Jupiter ~11 Re)
@@ -62,6 +64,7 @@ _NORM = {
     "tier_goal_norm":               1.0,         # already /3
     # global
     "n_observations_norm":          5000.0,      # reasonable upper bound
+    "used_idle_fraction":           1.0,         # already a fraction
 }
 
 
@@ -120,12 +123,32 @@ def _build_event_row(
     target_id = ev["target_id"]
     target = state._target_lookup.get(target_id)
 
+    from ariel_rl.data.schemas import COST_FACTOR
     # Compute dynamic event costs
-    slew_days = _slew_to_event(ev, state)
+    slew_days    = _slew_to_event(ev, state)
     window_start = float(ev["window_start"])
     window_end   = float(ev["window_end"])
+    window_mid   = float(ev["window_mid"])
     dur_days     = float(ev["duration_days"])
-    total_cost   = slew_days + dur_days  # wait excluded (highly variable, encodes separately)
+    block_dur    = float(ev["block_duration_days"]) if "block_duration_days" in ev.index else COST_FACTOR * dur_days
+    # Idle time if arrived early (consistent with execute_observation)
+    t_arrive     = t_now + slew_days
+    block_start  = window_mid - block_dur / 2.0
+    block_end    = window_mid + block_dur / 2.0
+    idle_days    = max(0.0, block_start - t_arrive)
+    total_cost   = slew_days + idle_days + block_dur
+
+    # Fraction of the observation block that would be captured if chosen now.
+    # Mirrors the three cases in MissionState.execute_observation:
+    #   Case A: t_arrive ≤ block_start  → 1.0
+    #   Case B: block_start < t_arrive < block_end → (block_end - t_arrive) / block_dur
+    #   Case C: t_arrive ≥ block_end    → 0.0
+    if t_arrive >= block_end:
+        capture_fraction = 0.0
+    elif t_arrive <= block_start:
+        capture_fraction = 1.0
+    else:
+        capture_fraction = (block_end - t_arrive) / block_dur
 
     # Window urgency: fraction of the transit window already elapsed.
     # 0 = window just opened, approaching 1 = window nearly closed.
@@ -138,7 +161,7 @@ def _build_event_row(
     # Progress for this target — use fast dict instead of pandas .loc
     prog_row = state._progress_dict.get(target_id)
     progress_in_tier = float(prog_row["progress_in_tier"]) if prog_row is not None else 0.0
-    obs_rem = int(prog_row["obs_remaining_next_tier"]) if prog_row is not None else 1
+    obs_rem = float(prog_row["obs_remaining_next_tier"]) if prog_row is not None else 1.0
 
     # Normalize obs_remaining by the target's *own* tier-3 requirement so
     # "fraction of work left" is in [0, 1] independent of catalogue-wide scale.
@@ -153,7 +176,9 @@ def _build_event_row(
         "slew_time_days":               slew_days,
         "window_urgency_norm":          window_urgency,        # already in [0, 1]
         "duration_days":                dur_days,
+        "block_duration_days":          block_dur,
         "total_time_cost_days":         total_cost,
+        "capture_fraction":             capture_fraction,      # already in [0, 1]
         "progress_in_tier":             progress_in_tier,
         "obs_remaining_next_tier_norm": obs_rem_norm,
         "base_science_value":           float(ev.get("base_science_value", 0.0)),
@@ -203,6 +228,7 @@ def _build_global(
         "tier3_fraction":             state.tier3_completed / max(n_total, 1),
         "used_science_fraction":      clk.used_science_time / mission_len,
         "used_slew_fraction":         clk.used_slew_time / mission_len,
+        "used_idle_fraction":         clk.used_idle_time / mission_len,
         "n_observations_norm":        clk.n_observations,
         "n_completed_targets_norm":   n_completed / max(n_total, 1),
     }

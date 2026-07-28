@@ -31,7 +31,7 @@ In the first version, this is treated as a budgeted target-selection problem. La
 
 ## Current status
 
-Core infrastructure and RL agent training are implemented and functional.
+Core infrastructure, realistic scheduling dynamics, and RL agent training are fully implemented.
 
 | Component | Status |
 |---|---|
@@ -39,12 +39,20 @@ Core infrastructure and RL agent training are implemented and functional.
 | Gymnasium environment (`ArielEnv`) with action masking | ✅ |
 | Five baseline scheduling heuristics | ✅ |
 | Evaluation framework + 7 diagnostic plot types | ✅ |
-| Multi-component reward (tier, progress, diversity, milestones, terminal) | ✅ |
+| Mission clock (science / slew / idle / overhead time tracking) | ✅ |
+| DynamicBackend: on-the-fly transit/eclipse windows, infinite horizon | ✅ |
+| Slew model (haversine + rate cap) | ✅ |
+| Feasibility-aware action masking (`block_end` threshold, partial-obs aware) | ✅ |
+| Observation timing: slew immediately → idle → observe (2.5 × T₁₄ block) | ✅ |
+| Partial observation model: mid-block arrivals give fractional progress (`capture_fraction`) | ✅ |
+| Multi-component reward (tier, progress, coverage potential U_pop, unique host, comparative, idle penalty, milestones, terminal) | ✅ |
+| Science weight floor + diversity multiplier | ✅ |
+| Reward config saved per training run for reproducibility | ✅ |
 | RL agents: MLP policy + Transformer policy (MaskablePPO) | ✅ |
 | Training CLI with device auto-detection and post-training plots | ✅ |
-| Realistic time-dependent scheduling constraints | 🔲 Planned |
+| Full-set action space (all N targets with per-planet features) | ✅ |
 
-The intended development path was:
+The intended development path:
 
 1. ✅ load and validate the Ariel MCS;
 2. ✅ compute tier-dependent observation costs in days;
@@ -52,7 +60,7 @@ The intended development path was:
 4. ✅ implement a Gymnasium-style environment;
 5. ✅ train simple baselines and RL agents;
 6. ✅ compare RL policies against random, greedy, and optimisation baselines;
-7. 🔲 add realistic scheduling constraints (transit windows, ephemerides, visibility).
+7. ✅ add realistic scheduling constraints (transit windows, ephemerides, slew model, idle tracking).
 
 ## Data
 
@@ -87,91 +95,62 @@ Column names may need to be adapted to the actual MCS release being used.
 
 ## Observation cost
 
-Observation cost is stored in days.
-
-For a target `i` and tier `k`:
+Each action advances the mission clock by:
 
 ```text
-cost_days(i, k) =
-    2.5 × transit_duration_T14_seconds(i) × n_observations(i, k) / 86400
+total_time = slew_time + idle_time + block_duration + overhead
+
+where:
+  block_duration = 2.5 × T14_seconds / 86400  (COST_FACTOR × T14 in days)
+  slew_time      = angular_separation / slew_rate  (clamped to [2 min, 2 hr])
+  idle_time      = max(0, block_start − t_arrive)  (arrived before window)
 ```
 
-The factor of `2.5` approximates the total observing window around a transit or eclipse event.
-
-In the demo notebook, the cost was initially computed using Tier 2 observations only. In the actual environment, cost should be tier-dependent and should be computed from the selected action.
+The 2.5× factor accounts for the transit/eclipse itself plus the required out-of-transit baseline.  All three tiers share the same per-observation block cost; higher tiers cost more in total because they require more observations.
 
 ## RL formulation
 
 ### State
 
-The first useful state representation should include:
+The agent observation at each step is a dict of two arrays:
 
-```text
-current mission day
-remaining mission budget in days
-target feature matrix
-targets already selected
-current science-bin counts
-desired or reference science-bin counts
-tier-completion state
-valid action mask
-```
+**Per-event features** (`obs["events"]`, shape `K × 18`) — one row per candidate event:
 
-Later versions should include:
+*Static* (fixed per target): `base_science_value`, `science_weight`, `planet_radius`, `planet_temperature`, `planet_mass`, `stellar_temperature`, `stellar_metallicity`, `tier_goal`, `event_type`.
 
-```text
-next observable event time
-target visibility windows
-transit/eclipse type
-ephemeris uncertainty
-revisit requirements
-slew or operational overheads if modelled
-```
+*Dynamic* (update each step): `slew_time_days`, `window_urgency_norm`, `duration_days`, `block_duration_days` (= 2.5 × T₁₄), `total_time_cost_days` (slew + idle + block), `capture_fraction` (**new** — fraction of block still capturable if chosen now; 1 = full, <1 = partial late arrival), `progress_in_tier`, `obs_remaining_next_tier_norm`, `days_to_window_end_norm`.
+
+**Global mission features** (`obs["global"]`, shape `G = 26`) — mission-level summary the same for all K candidates:
+
+`fraction_elapsed`, `tier1/2/3_fraction`, `used_science_fraction`, `used_slew_fraction`, `used_idle_fraction`, `n_observations_norm`, `n_completed_targets_norm`, + 17 per-population-bin coverage fractions.
 
 ### Action
 
-Initial prototype:
-
 ```text
-action = target_index
+action ∈ {0, …, K−1}  (topk mode, default)
+action ∈ {0, …, N−1}  (target / full_set mode)
 ```
 
-Preferred next version:
-
-```text
-action = (target_index, tier)
-```
-
-For large catalogues, the environment should use action masking so that the agent only chooses from currently valid targets or target-tier combinations.
+Invalid actions are masked out at every step by the feasibility-aware action mask.  With `MaskablePPO` the agent only ever sees valid actions.
 
 ### Reward
 
-The reward should favour scientific coverage rather than raw observation count.
-
-A first reward model:
+The reward is a sum of scientifically motivated components (all configurable in YAML):
 
 ```text
 reward =
-    diversity_gain
-  + underrepresented_bin_bonus
-  + tier_completion_bonus
-  - time_cost_penalty
-  - repeat_observation_penalty
-  - invalid_action_penalty
+    tier_completion_bonus          (sparse, per tier boundary crossed)
+  + progress_shaping               (dense, per observation toward a tier)
+  + coverage_potential_U_pop       (dense, marginal Σ_b min(q_b/quota, 1))
+  + unique_host_bonus              (sparse, first T1 in each planetary system)
+  + comparative_planetology_bonus  (sparse, T1 with T1+ sibling on same host)
+  + rarity_bonus                   (dense, long-period targets)
+  − idle_penalty                   (dense, per-day waiting before block starts)
+  − miss_penalty                   (sparse, arrived after block_end — no capture possible)
+  [+ milestone bonuses + terminal bonus]
 ```
 
-Possible science bins:
-
-```text
-planet radius class
-planet temperature class
-planet mass or density class
-host-star temperature class
-host-star metallicity class
-orbital period class
-```
-
-The central reward idea is chemical consensus: the agent should learn to distribute observations across scientifically meaningful populations rather than repeatedly selecting the cheapest or easiest targets.
+Population bins: `planet_radius × planet_temperature × stellar_type` (3-dimensional grid, 17 bins with ≥ 10 targets each).
 
 ## Repository structure
 
@@ -287,7 +266,7 @@ Outputs are written to `outputs/<run-name>/`:
 ### Run tests
 
 ```bash
-pytest  # 167 tests
+pytest  # 140+ tests
 ```
 
 ## Baselines
@@ -317,44 +296,43 @@ The transformer treats each of the K candidate events as a token and uses self-a
 
 ## Development roadmap
 
-### Phase 1: Static target selection
+### ✅ Phase 1–3: Core environment (complete)
 
-* Load full MCS.
-* Keep all targets unless there is a technical reason to exclude a row.
-* Compute all observation costs in days.
-* Build science bins.
-* Implement reward based on diversity and budget use.
-* Train simple agents on target-only actions.
+* MCS loading, population bins, tier costs.
+* Gymnasium environment with action masking, DynamicBackend, mission clock.
+* Slew model, idle tracking, 2.5 × T₁₄ observation blocks.
+* Multi-component reward: tier completion, progress shaping, coverage potential U_pop, unique-host, comparative planetology, idle penalty, rarity, milestones, terminal bonus.
+* Transformer and MLP policies with MaskablePPO.
+* Per-run reward config saving for reproducibility.
 
-### Phase 2: Tier-aware selection
+### ✅ Phase 4: Partial observations + fractional progress (complete)
 
-* Extend the action space to target-tier pairs.
-* Penalise repeated or inconsistent tier choices.
-* Add separate Tier 1, Tier 2, and Tier 3 science objectives.
-* Compare policies against greedy tier allocation.
+* Partial-observation model: arriving mid-block gives `capture_fraction = (block_end − t_arrive) / block_dur`.
+* `obs_completed` is now a **float** — fractions accumulate toward integer tier thresholds.
+* New `capture_fraction` observation feature (index 5 in event vector).
+* Action mask updated to use `block_end` (not `window_end`) as miss cutoff — agents now see opportunities even when the raw transit has ended.
+* `full_set` action mask is more permissive: omits the budget-fit check, letting the agent decide whether a partial capture is worthwhile.
+* 22 new partial-observation tests covering Cases A, B, C, and accumulation.
 
-### Phase 3: Time-evolving environment
+### 🔄 Phase 5: Policy improvement
 
-* Add mission clock.
-* Advance time after each observation.
-* Track target states over mission time.
-* Add event-based observations using transit and eclipse timing.
-* Use action masks for currently observable targets.
+* Curriculum training: T1-only short episodes → full 3.5-year mission.
+* Offline pre-training from `SmartGreedy` rollouts → fine-tune with PPO.
+* Ablation: `efficiency_weight`, `diversity_multiplier_max`, tier bonus ratios.
+* Multi-seed evaluation with mean ± std reporting.
 
-### Phase 4: Realistic scheduling
+### 🔲 Phase 6: Full-set policy architecture (Set Transformer / ISAB)
 
-* Add visibility windows.
-* Add ephemeris constraints.
-* Add revisit constraints.
-* Add operational gaps or overheads.
-* Evaluate whether RL remains useful compared with classical scheduling and optimisation methods.
+* Implement ISAB-based Set Transformer policy for the `full_set` action space.
+* Permutation-equivariant processing of the full ~800-planet catalogue.
+* Train and compare against top-K transformer baseline.
 
-### Phase 5: Science evaluation
+### 🔲 Phase 6: Science evaluation
 
-* Compare final selected samples against desired population distributions.
-* Analyse coverage of planet radius, temperature, mass, density, stellar type, and metallicity.
-* Quantify whether the selected sample supports balanced atmospheric-demographic inference.
-* Stress-test policies under catalogue uncertainty and missing values.
+* Compare selected samples against desired population distributions.
+* Quantify coverage of planet radius, temperature, mass, density, stellar type, and metallicity.
+* Stress-test under catalogue uncertainty, missing values, and ephemeris drift.
+* Assess comparative-planetology and multi-planet-system characterisation.
 
 ## Notebooks
 

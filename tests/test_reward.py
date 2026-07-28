@@ -252,7 +252,10 @@ def _step(
     progress_after=0.2,
     obs_duration_days=0.05,
     slew_days=0.01,
+    idle_days=0.0,
+    total_cost_days=None,
 ):
+    total = total_cost_days if total_cost_days is not None else (obs_duration_days + slew_days + idle_days)
     return dict(
         missed=missed,
         science_weight=science_weight,
@@ -263,24 +266,32 @@ def _step(
         progress_after=progress_after,
         obs_duration_days=obs_duration_days,
         slew_days=slew_days,
+        idle_days=idle_days,
+        total_cost_days=total,
     )
+
+
+def _reward(step, cfg, bin_totals, bin_observed=None):
+    """Helper that calls compute_reward with the new signature (same dict for before/after)."""
+    obs = bin_observed if bin_observed is not None else {}
+    return compute_reward(step, cfg, bin_totals, bin_observed_before=obs, bin_observed_after=obs)
 
 
 class TestComputeReward:
     def test_missed_returns_negative_miss_penalty(self, default_cfg, bin_totals):
-        r = compute_reward(_step(missed=True), default_cfg, bin_totals, {})
+        r = _reward(_step(missed=True), default_cfg, bin_totals, {})
         assert r == pytest.approx(-default_cfg.miss_penalty)
 
     def test_missed_does_not_add_other_components(self, default_cfg, bin_totals):
         """A missed event should only incur the miss penalty, nothing else."""
-        r = compute_reward(
+        r = _reward(
             _step(missed=True, tier_before=0, tier_after=1),
             default_cfg, bin_totals, {},
         )
         assert r == pytest.approx(-default_cfg.miss_penalty)
 
     def test_no_tier_completion_no_tier_bonus(self, default_cfg, bin_totals):
-        r = compute_reward(
+        r = _reward(
             _step(tier_before=0, tier_after=0, progress_before=0.0, progress_after=0.2),
             default_cfg, bin_totals, {},
         )
@@ -295,38 +306,30 @@ class TestComputeReward:
         assert r < expected_tier_bonus
 
     def test_tier1_completion_bonus_positive(self, default_cfg, bin_totals):
-        r = compute_reward(
+        r = _reward(
             _step(tier_before=0, tier_after=1, progress_before=0.8, progress_after=0.0),
             default_cfg, bin_totals, {},
         )
-        # T1 bonus = 1.0 * science_weight * div_mult + efficiency
+        # T1 bonus = tier1_completion * science_weight * div_mult + efficiency
         assert r > 0.0
 
     def test_tier3_completion_bonus_largest(self, default_cfg, bin_totals):
-        r_t1 = compute_reward(
-            _step(tier_before=0, tier_after=1), default_cfg, bin_totals, {}
-        )
-        r_t3 = compute_reward(
-            _step(tier_before=2, tier_after=3), default_cfg, bin_totals, {}
-        )
+        r_t1 = _reward(_step(tier_before=0, tier_after=1), default_cfg, bin_totals, {})
+        r_t3 = _reward(_step(tier_before=2, tier_after=3), default_cfg, bin_totals, {})
         assert r_t3 > r_t1
 
     def test_higher_science_weight_gives_higher_reward(self, default_cfg, bin_totals):
-        r_low = compute_reward(
-            _step(science_weight=0.2), default_cfg, bin_totals, {}
-        )
-        r_high = compute_reward(
-            _step(science_weight=1.0), default_cfg, bin_totals, {}
-        )
+        r_low  = _reward(_step(science_weight=0.2), default_cfg, bin_totals, {})
+        r_high = _reward(_step(science_weight=1.0), default_cfg, bin_totals, {})
         assert r_high > r_low
 
     def test_efficiency_reward_penalises_long_slew(self, default_cfg, bin_totals):
         """Observation with short slew should score higher than long slew."""
-        r_short = compute_reward(
+        r_short = _reward(
             _step(obs_duration_days=0.05, slew_days=0.001),
             default_cfg, bin_totals, {},
         )
-        r_long = compute_reward(
+        r_long = _reward(
             _step(obs_duration_days=0.05, slew_days=1.0),
             default_cfg, bin_totals, {},
         )
@@ -334,41 +337,35 @@ class TestComputeReward:
 
     def test_rare_bin_gets_higher_reward(self, default_cfg, bin_totals):
         """An under-observed bin should produce a higher reward than a saturated one."""
-        bin_obs_saturated = {"hot_jupiter": 10}   # fully observed
-        bin_obs_empty = {}                        # nothing observed yet
-
-        r_saturated = compute_reward(
+        bin_obs_saturated = {"hot_jupiter": 10}
+        bin_obs_empty     = {}
+        r_saturated = _reward(
             _step(population_bin="hot_jupiter"), default_cfg, bin_totals, bin_obs_saturated
         )
-        r_rare = compute_reward(
+        r_rare = _reward(
             _step(population_bin="hot_jupiter"), default_cfg, bin_totals, bin_obs_empty
         )
         assert r_rare > r_saturated
 
     def test_no_progress_shaping_on_tier_completion(self, default_cfg, bin_totals):
-        """When a tier is crossed, progress shaping is NOT added (to avoid
-        negative delta from progress reset)."""
-        # tier_after > tier_before means progress resets to 0 after boundary
-        r_with_crossing = compute_reward(
+        """When a tier is crossed, progress shaping is NOT added."""
+        r_with_crossing = _reward(
             _step(tier_before=0, tier_after=1, progress_before=0.9, progress_after=0.0),
             default_cfg, bin_totals, {},
         )
-        r_without_crossing = compute_reward(
+        r_without_crossing = _reward(
             _step(tier_before=0, tier_after=0, progress_before=0.7, progress_after=0.9),
             default_cfg, bin_totals, {},
         )
-        # The tier-crossing step gets tier1 bonus (1.0 * scale + efficiency)
-        # The non-crossing step gets only progress shaping + efficiency
-        # Tier bonus dominates, so r_with_crossing > r_without_crossing here
         assert r_with_crossing > r_without_crossing
 
     def test_reward_is_float(self, default_cfg, bin_totals):
-        r = compute_reward(_step(), default_cfg, bin_totals, {})
+        r = _reward(_step(), default_cfg, bin_totals, {})
         assert isinstance(r, float)
 
     def test_zero_efficiency_weight_removes_efficiency_bonus(self, bin_totals):
         cfg_no_eff = RewardConfig(efficiency_weight=0.0, progress_weight=0.0)
-        r = compute_reward(
+        r = _reward(
             _step(tier_before=0, tier_after=0, progress_before=0.1, progress_after=0.1),
             cfg_no_eff, bin_totals, {},
         )

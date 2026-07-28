@@ -85,19 +85,27 @@ def _stellar_label(spectral_type: str | None, teff: float | None) -> str:
 # Public API
 # ---------------------------------------------------------------------------
 
-def assign_population_bins(targets: pd.DataFrame) -> pd.DataFrame:
+def assign_population_bins(
+    targets: pd.DataFrame,
+    science_weight_floor: float = 0.3,
+) -> pd.DataFrame:
     """Add ``population_bin`` and ``science_weight`` columns to *targets*.
 
     Parameters
     ----------
     targets:
         DataFrame produced by ``load_catalogue.load_mcs``.
+    science_weight_floor:
+        Minimum science weight after normalisation.  The most common bin would
+        otherwise receive exactly 0; setting a floor (0.25–0.5 recommended)
+        ensures common populations remain scientifically meaningful.
+        Weights are remapped as: ``w' = floor + (1 − floor) * w_normalised``.
 
     Returns
     -------
     pd.DataFrame
         Same rows, with ``population_bin`` (string) and ``science_weight``
-        (float, 0–1) columns filled in.
+        (float, floor–1) columns filled in.
     """
     targets = targets.copy()
 
@@ -119,19 +127,39 @@ def assign_population_bins(targets: pd.DataFrame) -> pd.DataFrame:
         f"{r}_{t}_{s}" for r, t, s in zip(r_labels, t_labels, s_labels)
     ]
 
-    targets["science_weight"] = _compute_weights(targets["population_bin"])
+    targets["science_weight"] = _compute_weights(
+        targets["population_bin"], floor=science_weight_floor
+    )
 
     return targets
 
 
-def _compute_weights(bins: pd.Series) -> pd.Series:
-    """Inverse-frequency weights, normalised to [0, 1]."""
+def _compute_weights(bins: pd.Series, floor: float = 0.3) -> pd.Series:
+    """Inverse-frequency weights with a floor, normalised to [floor, 1].
+
+    Parameters
+    ----------
+    bins:
+        Series of population bin labels.
+    floor:
+        Minimum weight for the most common bin.  Prevents any target from
+        receiving a science weight of exactly zero.
+
+    Returns
+    -------
+    pd.Series of float in [floor, 1].
+    """
     counts = bins.value_counts()
     raw_weights = bins.map(lambda b: 1.0 / counts.get(b, 1))
     w_min, w_max = raw_weights.min(), raw_weights.max()
     if w_max == w_min:
-        return pd.Series(np.ones(len(bins)), index=bins.index, dtype="float64")
-    return ((raw_weights - w_min) / (w_max - w_min)).astype("float64")
+        return pd.Series(
+            np.full(len(bins), fill_value=1.0),
+            index=bins.index,
+            dtype="float64",
+        )
+    normalised = (raw_weights - w_min) / (w_max - w_min)
+    return (floor + (1.0 - floor) * normalised).astype("float64")
 
 
 def bin_summary(targets: pd.DataFrame) -> pd.DataFrame:

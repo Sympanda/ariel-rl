@@ -3,9 +3,16 @@ Action mask computation for both action space types.
 
 A valid action is one where:
   1. visibility_valid is True on the event
-  2. The event's window_end hasn't already passed
-  3. The total cost (slew + obs duration) fits in remaining mission time
-  4. (optional) The target hasn't already reached max_tier
+  2. The observation block hasn't already fully elapsed (block_end > t_now)
+  3. The telescope can arrive before the block ends (t_arrive < block_end)
+     giving a non-zero captured_fraction
+  4. The total cost fits in remaining mission time (topk / target modes)
+  5. (optional) The target hasn't already reached max_tier
+
+For ``full_set`` mode the check is more permissive: only conditions 3 and 5
+are enforced.  The intent is to let the agent decide whether a small partial
+capture is worth the slew; the environment always returns a non-negative reward
+for any non-zero capture.
 
 Returns a boolean numpy array of shape (n_candidates,).
 True = agent may choose this action.
@@ -46,7 +53,17 @@ def compute_mask(
     if cfg.type == "topk":
         return _mask_topk(state, candidate_events)
     elif cfg.type == "target":
-        return _mask_target(state, candidate_events, cfg.target.include_completed)
+        return _mask_target(
+            state, candidate_events,
+            include_completed=cfg.target.include_completed,
+            permissive=False,
+        )
+    elif cfg.type == "full_set":
+        return _mask_target(
+            state, candidate_events,
+            include_completed=cfg.full_set.include_completed,
+            permissive=True,   # relax can_fit check; let agent weigh partial captures
+        )
     else:
         raise ValueError(f"Unknown action space type: {cfg.type!r}")
 
@@ -54,11 +71,23 @@ def compute_mask(
 def _mask_topk(state: "MissionState", events: pd.DataFrame) -> np.ndarray:
     """Mask for the top-K upcoming event list.
 
-    Avoids per-row Python overhead by extracting event columns as numpy arrays
-    upfront and computing slew in a single loop (slew itself is a pure-Python
-    scalar — a fully vectorised slew would require RA/Dec arrays on state).
+    Timing model (consistent with MissionState.execute_observation):
+        slew immediately  →  idle if arrived before block_start  →  observe block
+
+    An action is valid when:
+      1. visibility_valid is True
+      2. Observation block hasn't fully elapsed (block_end > t_now)
+      3. Telescope arrives before block_end (any non-zero capture possible)
+      4. Total cost (slew + idle + block_duration) fits in remaining mission time
+      5. Target has not yet reached max_tier
+
+    The miss threshold is ``block_end`` (not ``window_end``) to be consistent
+    with MissionState.execute_observation's partial-observation model: arriving
+    within the observation block but after the raw transit still yields a
+    partial capture.
     """
     from ariel_rl.simulator.slew import slew_time_days
+    from ariel_rl.data.schemas import COST_FACTOR
 
     n = len(events)
     if n == 0:
@@ -68,21 +97,26 @@ def _mask_topk(state: "MissionState", events: pd.DataFrame) -> np.ndarray:
     remaining = state.clock.remaining_time
 
     # Extract columns once (avoids pandas per-row overhead)
-    vis = events["visibility_valid"].to_numpy(dtype=bool)
-    wend = events["window_end"].to_numpy(dtype=float)
-    dur = events["duration_days"].to_numpy(dtype=float)
+    vis  = events["visibility_valid"].to_numpy(dtype=bool)
+    wmid = events["window_mid"].to_numpy(dtype=float)
     tids = events["target_id"].to_numpy()
+    # block_duration_days is populated by DynamicBackend; fall back for legacy rows
+    if "block_duration_days" in events.columns:
+        bldur = events["block_duration_days"].to_numpy(dtype=float)
+    else:
+        bldur = COST_FACTOR * events["duration_days"].to_numpy(dtype=float)
+
+    bend = wmid + bldur / 2.0   # block_end for each event
 
     mask = np.zeros(n, dtype=bool)
     for i in range(n):
         if not vis[i]:
             continue
-        if wend[i] <= t_now:
+        if bend[i] <= t_now:
             continue
         target = state._target_lookup.get(tids[i])
         if target is None:
             continue
-        # Mask out targets that have already reached their max tier.
         prog = state._progress_dict.get(tids[i])
         if prog is not None and int(prog["current_tier"]) >= int(target["max_tier"]):
             continue
@@ -90,15 +124,15 @@ def _mask_topk(state: "MissionState", events: pd.DataFrame) -> np.ndarray:
             ra1=state.current_ra, dec1=state.current_dec,
             ra2=float(target["ra"]), dec2=float(target["dec"]),
         )
-        if slew + dur[i] > remaining:
+        t_arrive = t_now + slew
+        # Telescope must arrive before block_end to capture anything.
+        if t_arrive >= bend[i]:
             continue
-        # Feasibility: would the slew arrive before window_end?
-        # Approximate window_start = window_end - duration (symmetric window).
-        # The sim jumps to window_start first, then slews, so the effective
-        # arrival time is max(t_now, window_start) + slew.
-        window_start_approx = wend[i] - dur[i]
-        effective_t = max(t_now, window_start_approx)
-        if effective_t + slew > wend[i]:
+        # Idle: wait for block_start if arrived early
+        block_start = wmid[i] - bldur[i] / 2.0
+        idle = max(0.0, block_start - t_arrive)
+        total_cost = slew + idle + bldur[i]
+        if total_cost > remaining:
             continue
         mask[i] = True
 
@@ -109,12 +143,27 @@ def _mask_target(
     state: "MissionState",
     next_events: pd.DataFrame,
     include_completed: bool,
+    permissive: bool = False,
 ) -> np.ndarray:
-    """Mask for the full-target action space.
+    """Mask for the full-target and full_set action spaces.
 
     ``next_events`` has one row per target (the next available event for that
     target, or a sentinel row with ``visibility_valid=False`` if none).
+
+    Parameters
+    ----------
+    include_completed:
+        If False, targets already at max_tier are masked out.
+    permissive:
+        Used by ``full_set`` mode.  When True, the ``can_fit`` (budget) check
+        is omitted — only the block_end feasibility constraint is kept.  This
+        lets the agent see partial-capture opportunities even when the total
+        idle+block cost would exceed the remaining budget, since the actual
+        captured duration may be much shorter.
     """
+    from ariel_rl.simulator.slew import slew_time_days
+    from ariel_rl.data.schemas import COST_FACTOR
+
     n = len(next_events)
     mask = np.zeros(n, dtype=bool)
     t_now = state.clock.current_time
@@ -126,23 +175,26 @@ def _mask_target(
 
         # Completed targets
         if not include_completed:
-            prog = state.progress.loc[target_id] if target_id in state.progress.index else None
+            prog = state._progress_dict.get(target_id)
             if prog is not None:
                 target_row = state._target_lookup.get(target_id)
                 if target_row is not None:
-                    max_tier = int(target_row["max_tier"])
-                    current_tier = int(prog["current_tier"])
-                    if current_tier >= max_tier:
+                    if int(prog["current_tier"]) >= int(target_row["max_tier"]):
                         continue
 
         # No event available (sentinel row)
         if not bool(ev.get("visibility_valid", False)):
             continue
 
-        if float(ev.get("window_end", t_now)) <= t_now:
+        raw_dur   = float(ev.get("duration_days", 0.0))
+        block_dur = float(ev.get("block_duration_days", COST_FACTOR * raw_dur))
+        wmid      = float(ev.get("window_mid", t_now))
+        block_end = wmid + block_dur / 2.0
+
+        # Block must not have fully elapsed yet
+        if block_end <= t_now:
             continue
 
-        from ariel_rl.simulator.slew import slew_time_days
         target = state._target_lookup.get(target_id)
         if target is None:
             continue
@@ -151,9 +203,16 @@ def _mask_target(
             ra1=state.current_ra, dec1=state.current_dec,
             ra2=float(target["ra"]), dec2=float(target["dec"]),
         )
-        dur = float(ev.get("duration_days", 0.0))
-        if not state.clock.can_fit(slew + dur):
+        t_arrive = t_now + slew
+        # Telescope must arrive before the block ends (any capture possible)
+        if t_arrive >= block_end:
             continue
+
+        if not permissive:
+            block_start = wmid - block_dur / 2.0
+            idle = max(0.0, block_start - t_arrive)
+            if not state.clock.can_fit(slew + idle + block_dur):
+                continue
 
         mask[i] = True
 

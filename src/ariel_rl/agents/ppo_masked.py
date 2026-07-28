@@ -66,7 +66,7 @@ def make_masked_env(
     config: EnvConfig,
     seed: int = 0,
     targets=None,
-    events=None,
+    events=None,   # unused — retained for backward-compat
 ) -> ActionMasker:
     """
     Create a single ActionMasker-wrapped ArielEnv ready for MaskablePPO.
@@ -81,7 +81,8 @@ def make_masked_env(
     targets : pd.DataFrame, optional
         Pre-built target table (skip CSV loading if provided).
     events : pd.DataFrame, optional
-        Pre-built event table (skip event generation if provided).
+        Unused — retained for backward-compatibility.  The environment uses
+        ``DynamicBackend`` and no longer requires a pre-computed event table.
 
     Returns
     -------
@@ -90,8 +91,6 @@ def make_masked_env(
     kwargs = {"config": config}
     if targets is not None:
         kwargs["targets"] = targets
-    if events is not None:
-        kwargs["events"] = events
 
     env = ArielEnv(**kwargs)
     # ActionMasker must wrap ArielEnv directly so _get_action_mask receives an
@@ -108,7 +107,7 @@ def make_training_envs(
     n_envs: int = 1,
     seed: int = 0,
     targets=None,
-    events=None,
+    events=None,   # retained for backward-compat; unused (DynamicBackend)
 ) -> DummyVecEnv:
     """
     Create a ``DummyVecEnv`` of ``n_envs`` ActionMasker-wrapped ArielEnvs.
@@ -116,8 +115,9 @@ def make_training_envs(
     Each environment gets a unique seed offset (``seed + i``) so episodes
     are independently randomised.
 
-    Pre-built ``targets`` and ``events`` tables are shared across all envs
-    (they are read-only; each env has its own ``MissionState`` copy).
+    The ``targets`` table is shared across all envs (read-only).  Each env
+    creates its own ``DynamicBackend`` instance internally so no pre-built
+    event table is required.
 
     Parameters
     ----------
@@ -126,8 +126,10 @@ def make_training_envs(
         Number of parallel environments.
     seed : int
         Base seed; env i uses ``seed + i``.
-    targets, events : pd.DataFrame, optional
-        Pre-built tables.  Pass these to avoid regenerating events N times.
+    targets : pd.DataFrame, optional
+        Pre-built target table.  Passed straight through to ArielEnv.
+    events : pd.DataFrame, optional
+        Unused — retained for backward-compatibility only.
 
     Returns
     -------
@@ -135,7 +137,7 @@ def make_training_envs(
     """
     def _make_fn(i: int) -> Callable:
         def _fn() -> ActionMasker:
-            return make_masked_env(config, seed=seed + i, targets=targets, events=events)
+            return make_masked_env(config, seed=seed + i, targets=targets)
         return _fn
 
     return DummyVecEnv([_make_fn(i) for i in range(n_envs)])

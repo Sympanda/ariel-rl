@@ -29,6 +29,7 @@ def make_event(
     visibility_valid: bool = True,
     event_type: str = "transit",
 ) -> dict:
+    from ariel_rl.data.schemas import COST_FACTOR
     return {
         "event_id":              event_id,
         "target_id":             target_id,
@@ -38,6 +39,7 @@ def make_event(
         "window_end":            window_mid + duration_days / 2,
         "duration":              duration_days * 86400,
         "duration_days":         duration_days,
+        "block_duration_days":   COST_FACTOR * duration_days,
         "tier_goal":             2,
         "base_science_value":    0.5,
         "visibility_valid":      visibility_valid,

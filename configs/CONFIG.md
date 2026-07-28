@@ -81,24 +81,27 @@ slew:
 
 ```yaml
 action:
-  type: topk             # "topk" | "target"
+  type: topk             # "topk" | "target" | "full_set"
   topk:
     k: 50
     sort_by: window_mid  # ❌ dead
   target:
     include_completed: false
+  full_set:
+    include_completed: false
+    cache_static: true
 ```
 
 | Field | Default | Status | Effect |
 |---|---|---|---|
-| `type` | `"topk"` | ✅ | Selects the action space. `"topk"` presents the agent with the *K* next upcoming events; `"target"` presents all N targets and schedules the next event automatically. |
-| `topk.k` | `50` | ✅ | Size of the candidate window. The transformer sees a `(K × 16)` events matrix. Smaller K = narrower view but faster; larger K = wider scheduling horizon. |
-| `topk.sort_by` | `"window_mid"` | ❌ Dead | Intended to control candidate ordering but the backends always sort by `window_mid` internally; this value is never passed through. |
-| `target.include_completed` | `False` | ⚠️ Partial | Only applies when `type="target"`. If `False`, targets that have reached `max_tier` are masked out of the action space. |
+| `type` | `"topk"` | ✅ | Selects the action space. `"topk"` — K next events; `"target"` — all N targets (env picks next event per target); `"full_set"` — all N targets with full per-planet feature matrix. |
+| `topk.k` | `50` | ✅ | Size of the candidate window. The transformer sees a `(K × 17)` events matrix. Smaller K = narrower view but faster; larger K = wider scheduling horizon. |
+| `topk.sort_by` | `"window_mid"` | ❌ Dead | Backends always sort by `window_mid` internally; this value is never passed through. |
+| `target.include_completed` | `False` | ⚠️ Partial | Only applies when `type="target"` or `"full_set"`. If `False`, targets that have reached `max_tier` are masked out. |
+| `full_set.cache_static` | `True` | ✅ | Pre-compute static planet features at `reset()` and recompute only dynamic features each step. Saves ~2 ms/step on the full catalogue. |
 
-> **Note:** `type="target"` requires `TableBackend` (pre-computed events).
-> Use `type="topk"` with `DynamicBackend` for training (no pre-computation needed,
-> infinite horizon).
+> **Default backend**: `DynamicBackend` — no event table needed, infinite mission horizon.
+> All three action types work with `DynamicBackend`.  `TableBackend` is deprecated.
 
 ---
 
@@ -142,37 +145,46 @@ observation:
 | `normalise` | `True` | ✅ | Apply per-feature normalisation. Should always be `True` for RL training. |
 | `include_population_bin_fractions` | `True` | ✅ | Append one feature per population bin to `obs["global"]`. Gives the agent live diversity feedback. Set `False` to reduce obs size. |
 | `min_bin_targets` | `10` | ✅ | Exclude bins with fewer than this many targets. Prevents empty/near-zero features from wasting model capacity. With the default catalogue, `10` retains 17 bins → `G = 25` global features. |
-| `event_features` | All 16 (see below) | ✅ | Subset or reorder per-event features. Changing this directly changes the input dimension to the policy network — you must retrain after any change. |
-| `global_features` | All 8 (see below) | ✅ | Subset or reorder mission-state scalar features. Same caveat — retrain after changing. |
+| `event_features` | All 18 (see below) | ✅ | Subset or reorder per-event features. Changing this directly changes the input dimension to the policy network — you must retrain after any change. |
+| `global_features` | All 9 (see below) | ✅ | Subset or reorder mission-state scalar features. Same caveat — retrain after changing. |
 
-### Per-event features (`obs["events"]`, shape `K × 16`)
+### Per-event features (`obs["events"]`, shape `K × 18`)
 
-Each of the K candidate events contributes one row.  Rows beyond the real event count are zero-padded and correspond to masked actions.
+Each of the K candidate events contributes one row.  Rows beyond the real event count are zero-padded (masked actions).
+
+**Static features** (fixed per target across the mission):
+
+| Feature | Normalisation | Description |
+|---|---|---|
+| `base_science_value` | already [0,1] | Catalogue SNR-derived intrinsic value. |
+| `science_weight` | already [0,1] | Inverse-bin-frequency rarity weight (with `science_weight_floor` applied). |
+| `planet_radius_norm` | ÷ 20 R⊕ | Planet radius. |
+| `planet_temperature_norm` | ÷ 3000 K | Equilibrium temperature. |
+| `planet_mass_norm` | ÷ 4000 M⊕ | Planet mass. |
+| `stellar_temperature_norm` | ÷ 10000 K | Host star T_eff. |
+| `stellar_metallicity` | ÷ 1.5 dex | [Fe/H]. Negative values allowed; clipped to [−3, 3]. |
+| `tier_goal_norm` | ÷ 3 | Which tier this event contributes toward. |
+| `event_type_binary` | — | 0 = transit, 1 = eclipse. |
+
+**Dynamic features** (update every step):
 
 | Feature | Normalisation | Description |
 |---|---|---|
 | `slew_time_days` | ÷ 2-hr cap | Angular slew cost from current pointing. Core scheduling signal. |
-| `window_urgency_norm` | already [0,1] | `(t_now − window_start) / window_duration`. 0 = window just opened, →1 = closing. Replaces the old `wait_time_days`. |
-| `duration_days` | ÷ 1 day | Transit / eclipse duration T₁₄. |
-| `total_time_cost_days` | ÷ 1 day | `slew + duration` (excludes idle wait). |
-| `progress_in_tier` | already [0,1] | Fraction of observations completed toward the **next** tier boundary. 0 for unvisited targets. |
-| `obs_remaining_next_tier_norm` | ÷ per-target max | Observations still needed to reach the next tier, normalised so values are comparable across targets. |
-| `base_science_value` | already [0,1] | Catalogue SNR-derived intrinsic value. Static per target. |
-| `science_weight` | already [0,1] | Catalogue priority weight from rarity scoring. Static per target. |
-| `planet_radius_norm` | ÷ 20 R⊕ | Physical feature for population diversity. |
-| `planet_temperature_norm` | ÷ 3000 K | Equilibrium temperature. |
-| `planet_mass_norm` | ÷ 4000 M⊕ | Planet mass. |
-| `stellar_temperature_norm` | ÷ 10000 K | Host star T_eff. |
-| `stellar_metallicity` | ÷ 1.5 dex | [Fe/H]. Can be negative; clipped to [−3, 3]. |
-| `tier_goal_norm` | ÷ 3 | Which tier this observation contributes toward. |
-| `event_type_binary` | — | 0 = transit, 1 = eclipse. |
-| `days_to_window_end_norm` | ÷ 2 days | `(window_end − t_now)`. Absolute urgency; small = act now. Replaces the old `is_valid` (constant 1 after the mask fix). |
+| `window_urgency_norm` | already [0,1] | `(t_now − window_start) / window_duration`. 0 = just opened, →1 = closing. |
+| `duration_days` | ÷ 1 day | Raw transit/eclipse duration T₁₄. |
+| `block_duration_days` | ÷ 1 day | Full observation block = 2.5 × T₁₄; the authoritative clock advance per observation. |
+| `total_time_cost_days` | ÷ 3 days | `slew + idle + block_duration`. True cost from current state. |
+| `capture_fraction` | already [0,1] | **Fraction of the observation block capturable if chosen now.** 1.0 = arrive before block_start (full), <1 = arrive mid-block (partial). |
+| `progress_in_tier` | already [0,1] | Equivalent obs fraction completed toward the **next** tier boundary (float). |
+| `obs_remaining_next_tier_norm` | ÷ per-target max | Equivalent obs still needed (float), normalised for cross-target comparability. |
+| `days_to_window_end_norm` | ÷ 2 days | `window_end − t_now`. Absolute urgency; small = act now. |
 
-> **Removed features** (vs the old `simple.yaml`): `wait_time_days` (83 % zeros
-> — superseded by `window_urgency_norm`) and `is_valid` (constant 1.0 after the
-> action-mask feasibility fix — replaced by `days_to_window_end_norm`).
+> **Removed** (vs original design): `wait_time_days` (83% zeros → superseded by `window_urgency_norm`), `is_valid` (constant 1 → replaced by `days_to_window_end_norm`).
 
-### Global features (`obs["global"]`, shape `G = 25`)
+### Global features (`obs["global"]`, shape `G = 26`)
+
+**Named features (indices 0–8):**
 
 | Feature | Description |
 |---|---|
@@ -182,85 +194,92 @@ Each of the K candidate events contributes one row.  Rows beyond the real event 
 | `tier3_fraction` | T3-complete targets / total [0,1] |
 | `used_science_fraction` | Science time / mission length [0,1] |
 | `used_slew_fraction` | Slew time / mission length [0,1] |
-| `n_observations_norm` | Raw observation count ÷ 5000 |
-| `n_completed_targets_norm` | Fraction of targets fully at `max_tier` [0,1] |
-| + 17 population-bin fractions | `observations_in_bin / targets_in_bin` per bin (bins with ≥ `min_bin_targets` targets) |
+| `used_idle_fraction` | Idle/wait time / mission length [0,1] |
+| `n_observations_norm` | Cumulative observation count ÷ 5000 |
+| `n_completed_targets_norm` | Targets fully at `max_tier` / total [0,1] |
 
-> **Removed feature**: `n_missed_norm` (constant 0 after the action-mask
-> feasibility fix; replaced by `n_completed_targets_norm`).
+**Population-bin fractions (indices 9–25):** `observations_in_bin / targets_in_bin` per bin (bins with ≥ `min_bin_targets` targets; default 17 bins).
+
+> **Removed**: `n_missed_norm` (constant 0 after action-mask feasibility fix).
+> **Added**: `used_idle_fraction` — lets the agent see how much mission time it is losing to idle waiting.
 
 ---
 
 ## `RewardConfig`
 
+The canonical defaults live in `configs/reward/default.yaml` and are automatically saved to `outputs/<run_name>/reward_config.yaml` at training start for reproducibility.
+
 ```yaml
 reward:
-  # Sparse tier completion bonuses
-  tier1_completion: 1.0
-  tier2_completion: 3.0
-  tier3_completion: 10.0
+  # --- sparse tier completion ---
+  tier1_completion:           3.0
+  tier2_completion:           10.0
+  tier3_completion:           30.0
 
-  # Dense per-step shaping
-  progress_weight:           0.3
-  efficiency_weight:         0.5
-  near_completion_threshold: 0.7
-  near_completion_scale:     3.0
+  # --- dense progress shaping ---
+  progress_weight:            0.05
+  near_completion_threshold:  0.7
+  near_completion_scale:      3.0
 
-  # Rarity / difficulty bonus
-  rarity_weight:          0.5
-  rarity_period_ref_days: 365.0
+  # --- diversity multiplier ---
+  diversity_multiplier_max:   5.0
 
-  # Coverage milestone bonuses (one-shot per episode)
-  t1_milestone_fractions: [0.25, 0.5, 0.75, 0.90, 1.0]
-  t1_milestone_bonus: 20.0
+  # --- population coverage potential U_pop ---
+  coverage_quota_per_bin:     5
+  coverage_weight:            2.0
 
-  # Terminal episode bonus
-  t1_terminal_weight: 50.0
-  t1_terminal_power:  2.0
+  # --- science weight floor ---
+  science_weight_floor:       0.3
 
-  # Random-baseline subtraction
-  subtract_random_baseline: false
-  random_baseline_per_step: 4.0
+  # --- time efficiency ---
+  efficiency_weight:          0.0
+  idle_penalty_per_day:       0.005
 
-  # Penalties
-  miss_penalty: 0.1
-  invalid_action_penalty: 0.5   # ❌ dead — hardcoded -0.5 in ariel_env.py
+  # --- host diversity ---
+  unique_host_weight:         0.5
+  comparative_weight:         0.3
+
+  # --- rarity ---
+  rarity_weight:              0.5
+  rarity_period_ref_days:     365.0
+
+  # --- milestones / terminal ---
+  t1_milestone_fractions:     [0.25, 0.5, 0.75, 0.90, 1.0]
+  t1_milestone_bonus:         50.0
+  t1_terminal_weight:         300.0
+  t1_terminal_power:          2.0
+
+  # --- penalties ---
+  miss_penalty:               0.1
+  invalid_action_penalty:     0.5
 ```
 
 | Field | Default | Status | Effect |
 |---|---|---|---|
-| `tier1_completion` | `1.0` | ✅ | Sparse reward when a target crosses the T1 boundary. Scaled by `science_weight × diversity_mult` at runtime. |
-| `tier2_completion` | `3.0` | ✅ | Same for T2. Ratio T2/T1 = 3× incentivises going deeper on targets worth it. |
-| `tier3_completion` | `10.0` | ✅ | Same for T3. A target taken T1→T2→T3 earns `(1+3+10) × scale = 14 × scale` total. |
-| `progress_weight` | `0.3` | ✅ | Scale on the dense progress-shaping signal. Provides gradient in the long stretches between tier boundaries. Set to `0.0` for pure sparse reward (harder but less hand-engineered). |
+| `tier1_completion` | `3.0` | ✅ | Sparse reward when a target crosses the T1 boundary. Scaled by `science_weight × diversity_mult`. |
+| `tier2_completion` | `10.0` | ✅ | Same for T2. |
+| `tier3_completion` | `30.0` | ✅ | Same for T3. Full T1→T2→T3 earns `(3+10+30) × scale = 43 × scale` total. |
+| `progress_weight` | `0.05` | ✅ | Dense per-step shaping proportional to `Δprogress_in_tier`. Kept small — the tier bonuses dominate. |
 | `near_completion_threshold` | `0.7` | ✅ | `progress_in_tier` above which the near-finish boost fires. |
-| `near_completion_scale` | `3.0` | ✅ | Multiplier on progress reward when above threshold. Makes the final 30% of a tier worth 3× more per step — discourages abandoning almost-complete targets. |
-| `efficiency_weight` | `0.5` | ✅ | Scale on `obs_duration / (obs + slew)`. Penalises long slews without requiring a separate explicit slew penalty. Set to `0.0` to remove. |
-| `rarity_weight` | `0.5` | ✅ | Scale of the per-observation rarity bonus: `rarity_weight × (period / period_ref)² / tier_worked`. Set to `0.0` to disable. |
-| `rarity_period_ref_days` | `365.0` | ✅ | Orbital period [days] that maps to `difficulty = 1.0`. Planets with `period ≥ period_ref` all get the maximum difficulty score. |
-| `t1_milestone_fractions` | `[0.25, 0.5, 0.75, 0.9, 1.0]` | ✅ | T1 catalogue coverage fractions that each trigger a one-shot bonus. Fire at most once per episode. Directly incentivise breadth over the whole catalogue. |
-| `t1_milestone_bonus` | `20.0` | ✅ | Value of each milestone bonus. The 100% milestone pays double (`2 × bonus = 40`). |
-| `t1_terminal_weight` | `50.0` | ✅ | Scale of the end-of-episode bonus `weight × (t1_fraction)^power`. |
-| `t1_terminal_power` | `2.0` | ✅ | Exponent on T1 coverage. Quadratic (`2.0`) makes the last 10% of coverage far more valuable than the first 10% — the agent is pushed hardest to complete the survey. Set to `1.0` for linear. |
-| `subtract_random_baseline` | `false` | ✅ | If `true`, subtract `random_baseline_per_step` from every valid observation reward. Centres reward around zero for random-agent behaviour so PPO advantage estimates reflect improvement *over* random, not absolute magnitude. |
-| `random_baseline_per_step` | `4.0` | ✅ (when flag is on) | Constant to subtract per valid step. Calibrate as `total_random_reward / n_valid_observations` for your chosen reward weights. With `sparse_dominant.yaml` weights use ~`0.5` instead of `4.0`. |
-| `miss_penalty` | `0.1` | ✅ | Subtracted when the agent arrives after `window_end` (observation missed). |
-| `invalid_action_penalty` | `0.5` | ❌ Dead | Defined in config but `ArielEnv.step()` hardcodes `-0.5` directly. Since `MaskablePPO` never sends an invalid action, this rarely fires anyway. |
-
-### Reward magnitude reference
-
-At typical episode length with `SmartGreedy`:
-
-| Source | Approx. contribution |
-|---|---|
-| T1 completions (~200 targets) | 200 × 1.0 × ~1.5 scale ≈ **300** |
-| T2/T3 completions | smaller (fewer completions in 3.5 years) |
-| Progress shaping | **~50–100** (dense, many steps) |
-| Efficiency reward | **~50–100** (dense, every step) |
-| Rarity bonus | **~20–60** (dense; depends on period distribution) |
-| Coverage milestones | up to **100** (5 × 20, if reached) |
-| Terminal bonus | 50 × (0.25)² ≈ **3** (low T1 fraction in short episodes) |
-| **Total typical range** | **~200–600** per episode |
+| `near_completion_scale` | `3.0` | ✅ | Multiplier on progress reward near a tier boundary. |
+| `diversity_multiplier_max` | `5.0` | ✅ | Maximum diversity multiplier for a completely unseen bin. At 5.0 an unseen bin is 5× more attractive than a saturated one. |
+| `coverage_quota_per_bin` | `5` | ✅ | Desired T1+ observations per population bin for the U_pop coverage signal. Once a bin hits its quota, extra observations no longer earn coverage reward. |
+| `coverage_weight` | `2.0` | ✅ | Scale on the marginal `U_pop(s_{t+1}) − U_pop(s_t)` coverage signal. |
+| `science_weight_floor` | `0.3` | ✅ | Minimum science weight after rarity normalisation. Prevents the most common bin from receiving weight 0. |
+| `efficiency_weight` | `0.0` | ✅ | Scale on `obs_duration / total_cost`. Set to a positive value to explicitly reward efficient scheduling. Default 0 — the idle penalty covers this implicitly. |
+| `idle_penalty_per_day` | `0.005` | ✅ | Per-day cost for waiting before the observation block starts (arrived early). Encourages the agent not to lock on to a target well before its window. |
+| `unique_host_weight` | `0.5` | ✅ | Bonus fired the first time any target in a new planetary *system* reaches T1. |
+| `comparative_weight` | `0.3` | ✅ | Bonus fired when a T1 target shares a host star with at least one existing T1+ target (comparative planetology). Scales with number of siblings (capped at 3×). |
+| `rarity_weight` | `0.5` | ✅ | Per-observation bonus: `rarity_weight × (period/period_ref)² / tier_worked`. |
+| `rarity_period_ref_days` | `365.0` | ✅ | Period mapped to `difficulty = 1.0`. |
+| `t1_milestone_fractions` | `[0.25, 0.5, 0.75, 0.9, 1.0]` | ✅ | T1 coverage fractions that each trigger a one-shot bonus (fires at most once per episode). |
+| `t1_milestone_bonus` | `50.0` | ✅ | Value per milestone. 100% milestone pays double. |
+| `t1_terminal_weight` | `300.0` | ✅ | Scale of the end-of-episode bonus `weight × (t1_fraction)^power`. |
+| `t1_terminal_power` | `2.0` | ✅ | Quadratic default: near-complete T1 coverage is disproportionately rewarded. |
+| `subtract_random_baseline` | `false` | ✅ | If `true`, subtract `random_baseline_per_step` every valid step to centre reward around random-agent performance. |
+| `random_baseline_per_step` | `4.0` | ✅ (when flag on) | Calibrate from a short random-agent run: `total_reward / n_steps`. |
+| `miss_penalty` | `0.1` | ✅ | Subtracted when the agent arrives after `window_end`. |
+| `invalid_action_penalty` | `0.5` | ⚠️ | Applied by `ArielEnv.step()` directly; rarely fires with `MaskablePPO`. |
 
 ---
 

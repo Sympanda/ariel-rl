@@ -47,6 +47,7 @@ class MissionClock:
     current_time: float = field(init=False)
     used_science_time: float = field(default=0.0, init=False)
     used_slew_time: float = field(default=0.0, init=False)
+    used_idle_time: float = field(default=0.0, init=False)
     used_overhead_time: float = field(default=0.0, init=False)
     n_observations: int = field(default=0, init=False)
     n_missed: int = field(default=0, init=False)  # events we tried but arrived late
@@ -87,30 +88,46 @@ class MissionClock:
         self,
         obs_duration_days: float,
         slew_days: float = 0.0,
+        idle_days: float = 0.0,
         overhead_days: float = OBS_OVERHEAD_DAYS_BASE,
+        n_obs: int = 1,
     ) -> float:
-        """Advance the clock by one observation.
+        """Advance the clock by one observation campaign.
+
+        The canonical campaign structure is:
+            slew  →  idle (wait for block_start)  →  N × [observe + inter-transit gap]
+
+        For a single-transit action n_obs=1 and this is identical to the old
+        behaviour.  For a tier-completion campaign n_obs counts the number of
+        consecutive transits executed.
 
         Parameters
         ----------
         obs_duration_days:
-            Duration of the observation (T14 or E14 in days).
+            Total science time = n_obs × block_duration_days.
         slew_days:
             Time to slew from current pointing to target.
+        idle_days:
+            All non-science time after slewing: initial wait for first block +
+            inter-transit gaps between subsequent blocks.
         overhead_days:
-            Fixed per-observation overhead (settle, guide-star, etc.).
+            Fixed per-observation overhead (settle, guide-star, etc.).  Applied
+            once per *action*, not per transit.
+        n_obs:
+            Number of individual transit/eclipse observations in this campaign.
 
         Returns
         -------
         float
             Total time consumed in days.
         """
-        total = obs_duration_days + slew_days + overhead_days
+        total = slew_days + idle_days + obs_duration_days + overhead_days
         self.current_time += total
         self.used_science_time += obs_duration_days
         self.used_slew_time += slew_days
+        self.used_idle_time += idle_days
         self.used_overhead_time += overhead_days
-        self.n_observations += 1
+        self.n_observations += max(n_obs, 1)
         return total
 
     def skip_to(self, bjd: float) -> float:
@@ -147,6 +164,7 @@ class MissionClock:
         self.current_time = self.mission_start
         self.used_science_time = 0.0
         self.used_slew_time = 0.0
+        self.used_idle_time = 0.0
         self.used_overhead_time = 0.0
         self.n_observations = 0
         self.n_missed = 0
@@ -162,6 +180,7 @@ class MissionClock:
             "fraction_elapsed":   self.fraction_elapsed,
             "used_science_time":  self.used_science_time,
             "used_slew_time":     self.used_slew_time,
+            "used_idle_time":     self.used_idle_time,
             "used_overhead_time": self.used_overhead_time,
             "n_observations":     self.n_observations,
             "n_missed":           self.n_missed,

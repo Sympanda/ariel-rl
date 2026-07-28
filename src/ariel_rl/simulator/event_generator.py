@@ -36,6 +36,7 @@ import numpy as np
 import pandas as pd
 
 from ariel_rl.data.schemas import (
+    COST_FACTOR,
     METHOD_ECLIPSE,
     METHOD_EITHER,
     METHOD_TRANSIT,
@@ -141,6 +142,7 @@ def generate_events(
                         "window_end":            t_mid + dur_days / 2.0,
                         "duration":              dur_s,
                         "duration_days":         dur_days,
+                        "block_duration_days":   COST_FACTOR * dur_days,
                         "tier_goal":             max_tier,
                         "base_science_value":    base_val,
                         "visibility_valid":      bool(valid[i]),
@@ -154,7 +156,7 @@ def generate_events(
         return pd.DataFrame(columns=[
             "event_id", "target_id", "event_type",
             "window_start", "window_mid", "window_end",
-            "duration", "duration_days", "tier_goal",
+            "duration", "duration_days", "block_duration_days", "tier_goal",
             "base_science_value", "visibility_valid",
             "ephemeris_uncertainty", "event_index",
         ])

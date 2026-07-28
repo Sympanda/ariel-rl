@@ -102,11 +102,33 @@ class TargetActionConfig:
 
 
 @dataclass(frozen=True)
+class FullSetActionConfig:
+    """Config for the ``full_set`` action space (Phase 3).
+
+    The agent sees all N targets simultaneously, each described by the full
+    per-planet feature vector from ``planet_feature_builder``.  The action
+    is a target index 0…N-1; the env schedules the next available event for
+    that target.
+
+    This replaces top-K filtering with a learned ranking / attention over
+    the full catalogue.  It requires a set-based policy architecture
+    (e.g. transformer).
+
+    Note: computing dynamic features for all ~800 targets at every step is
+    O(N), typically < 5 ms.  Enable ``cache_static`` to pre-compute static
+    features at reset() and only recompute dynamic features each step.
+    """
+    include_completed: bool = False
+    cache_static: bool = True   # pre-compute static features at reset()
+
+
+@dataclass(frozen=True)
 class ActionConfig:
     """Selects which action space to use and carries its sub-config."""
-    type: str = "topk"                        # "topk" | "target"
+    type: str = "topk"                            # "topk" | "target" | "full_set"
     topk: TopKActionConfig = field(default_factory=TopKActionConfig)
     target: TargetActionConfig = field(default_factory=TargetActionConfig)
+    full_set: FullSetActionConfig = field(default_factory=FullSetActionConfig)
 
 
 # Per-event feature names the observation builder understands.
@@ -114,10 +136,12 @@ class ActionConfig:
 ALL_EVENT_FEATURES: list[str] = [
     "slew_time_days",                 # angular slew cost in days
     "window_urgency_norm",            # fraction of window already elapsed (0=fresh, 1=closing)
-    "duration_days",                  # transit / eclipse duration
-    "total_time_cost_days",           # slew + obs combined (excludes wait)
+    "duration_days",                  # raw transit / eclipse duration (T14)
+    "block_duration_days",            # full observation block = 2.5 × T14
+    "total_time_cost_days",           # slew + idle + block_duration
+    "capture_fraction",               # fraction of block capturable if chosen now (0–1)
     "progress_in_tier",               # fraction of obs completed toward next tier
-    "obs_remaining_next_tier_norm",   # obs still needed, normalised by max possible
+    "obs_remaining_next_tier_norm",   # equivalent obs still needed, normalised by max possible
     "base_science_value",             # catalogue SNR-derived value [0, 1]
     "science_weight",                 # catalogue priority weight [0, 1]
     "planet_radius_norm",             # planet radius / 20 Re
@@ -137,6 +161,7 @@ ALL_GLOBAL_FEATURES: list[str] = [
     "tier3_fraction",                 # T3-complete targets / total
     "used_science_fraction",          # science time / mission length
     "used_slew_fraction",             # slew time / mission length
+    "used_idle_fraction",             # idle/wait time / mission length
     "n_observations_norm",            # cumulative obs count / 5000
     "n_completed_targets_norm",       # fraction of targets fully completed (at max tier)
 ]
@@ -258,6 +283,45 @@ class RewardConfig:
     #   total_random_reward / n_steps  (typically ~4.0 for the default reward config).
     subtract_random_baseline:  bool  = False
     random_baseline_per_step:  float = 4.0
+
+    # --- idle time penalty ---
+    # Small per-day cost for time the telescope spends waiting for an event
+    # after arriving on target early.  Captures the opportunity cost of locking
+    # the telescope to a target well before the observation block starts.
+    # Set to 0.0 to disable.  Typical range: 0.001–0.01.
+    idle_penalty_per_day: float = 0.005
+
+    # --- population coverage potential (U_pop) ---
+    # Replaces the per-step diversity multiplier with a marginal coverage signal:
+    #   r_coverage = U(s_{t+1}) − U(s_t)
+    #   U(s) = sum_b  coverage_bin_weight_b * min(q_b / n_b, 1)
+    # where q_b = observed-Tier-1+ count in bin b, n_b = quota for bin b.
+    # Once a bin reaches its quota, extra observations stop contributing.
+    # coverage_quota_per_bin: desired number of T1+ observations per bin.
+    # coverage_weight: scale applied to the marginal U_pop signal.
+    coverage_quota_per_bin: int   = 5      # target coverage per population bin
+    coverage_weight:        float = 2.0    # scale on marginal coverage reward
+
+    # --- science weight floor ---
+    # Minimum science_weight for any target after inverse-frequency reweighting.
+    # Prevents the most-common bin from receiving exactly 0 science weight.
+    # Weights are remapped as: w' = floor + (1 − floor) * w_normalised
+    # Typical range: 0.25–0.5.
+    science_weight_floor: float = 0.3
+
+    # --- unique host diversity bonus ---
+    # Fired the first time a new planetary *system* (host star) has any target
+    # reach Tier 1.  Rewards breadth across stellar systems, not just bins.
+    # Set to 0.0 to disable.
+    unique_host_weight: float = 0.5
+
+    # --- comparative planetology bonus ---
+    # Fired when a target reaches Tier 1 and the same host already has at least
+    # one other Tier-1+ target.  Rewards completing scientifically useful pairs
+    # or triples within multi-planet systems (Ariel comparative planetology).
+    # Scales with the number of Tier-1+ siblings already in the system.
+    # Set to 0.0 to disable.
+    comparative_weight: float = 0.3
 
     # --- penalties ---
     miss_penalty:           float = 0.1

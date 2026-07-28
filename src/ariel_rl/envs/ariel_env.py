@@ -62,8 +62,13 @@ from gymnasium import spaces
 from ariel_rl.data.preprocess_targets import build_target_table
 from ariel_rl.envs.action_mask import any_valid, compute_mask
 from ariel_rl.envs.observation_builder import build as build_obs, observation_shapes
-from ariel_rl.simulator.event_backend import EventBackend, TableBackend
-from ariel_rl.simulator.event_generator import generate_events
+from ariel_rl.envs.planet_feature_builder import (
+    build_planet_features,
+    build_static_features,
+    N_PLANET_FEATURES,
+    PLANET_FEATURE_NAMES,
+)
+from ariel_rl.simulator.event_backend import EventBackend, DynamicBackend
 from ariel_rl.simulator.mission_state import MissionState
 from ariel_rl.simulator.slew import SLEW_RATE_DEG_PER_MIN, MIN_SLEW_S, MAX_SLEW_S
 from ariel_rl.rewards.compute_reward import (
@@ -91,18 +96,11 @@ class ArielEnv(gym.Env):
     targets:
         Pre-built target DataFrame (skips CSV loading if provided).
     events:
-        Pre-built event DataFrame for the ``TableBackend``.  Ignored when
-        *backend* is provided explicitly.
+        Unused — retained for backward-compatibility only.  The environment
+        now defaults to ``DynamicBackend`` which computes events on-the-fly.
     backend:
-        Optional pre-constructed ``EventBackend`` instance.  Use this to
-        select ``DynamicBackend`` without a pre-computed event table::
-
-            from ariel_rl.simulator.event_backend import DynamicBackend
-            env = ArielEnv(config, targets=targets,
-                           backend=DynamicBackend(targets))
-
-        When *None*, a ``TableBackend`` is created automatically from *events*
-        (or a freshly generated event table if *events* is also ``None``).
+        Optional pre-constructed ``EventBackend`` instance.  Defaults to
+        ``DynamicBackend(targets)`` when *None*.
     """
 
     metadata = {"render_modes": []}
@@ -141,59 +139,61 @@ class ArielEnv(gym.Env):
             self._targets["max_tier"] = self._targets["max_tier"].clip(upper=cap)
 
         # ---- event backend ----
+        self._events: pd.DataFrame = events if events is not None else pd.DataFrame()
         if backend is not None:
-            # Explicit backend supplied — use it directly.
             self._backend: EventBackend = backend
-            self._events: pd.DataFrame = events if events is not None else pd.DataFrame()
         else:
-            # Default: TableBackend wrapping a pre-computed (or freshly generated) table.
-            if events is not None:
-                self._events = events
-            else:
-                self._events = generate_events(
-                    self._targets,
-                    mission_start=self.cfg.mission.start_bjd,
-                    mission_end=self.cfg.mission.start_bjd + self.cfg.mission.lifetime_days,
-                )
-            self._backend = TableBackend(self._events)
+            self._backend = DynamicBackend(self._targets)
 
         # ---- determine action space size ----
         if self.cfg.action.type == "topk":
             self._n_actions = self.cfg.action.topk.k
-        elif self.cfg.action.type == "target":
-            if isinstance(self._backend, TableBackend):
-                self._n_actions = len(self._targets)
-            else:
-                raise ValueError(
-                    "The 'target' action space type requires TableBackend. "
-                    "Use action.type='topk' with DynamicBackend."
-                )
+        elif self.cfg.action.type in ("target", "full_set"):
+            self._n_actions = len(self._targets)
         else:
             raise ValueError(f"Unknown action type: {self.cfg.action.type!r}")
 
+        # ---- static per-planet feature cache (full_set mode) ----
+        self._static_planet_features: np.ndarray | None = None
+
         # ---- bootstrap a dummy state to measure observation shapes ----
-        _dummy_state = MissionState.from_tables(
+        _dummy_state = MissionState.from_backend(
             self._targets,
-            self._events,
+            backend=self._backend,
             mission_start=self.cfg.mission.start_bjd,
             mission_end=self.cfg.mission.start_bjd + self.cfg.mission.lifetime_days,
-            backend=self._backend,
         )
-        shapes = observation_shapes(_dummy_state, self.cfg.observation, self._n_actions)
 
         # ---- Gymnasium spaces ----
-        self.observation_space = spaces.Dict({
-            "events": spaces.Box(
-                low=-3.0, high=3.0,
-                shape=shapes["events"],
-                dtype=np.float32,
-            ),
-            "global": spaces.Box(
-                low=0.0, high=1.0,
-                shape=shapes["global"],
-                dtype=np.float32,
-            ),
-        })
+        if self.cfg.action.type == "full_set":
+            # Observation: per-planet features (N × F) + global
+            shapes = observation_shapes(_dummy_state, self.cfg.observation, self._n_actions)
+            self.observation_space = spaces.Dict({
+                "planets": spaces.Box(
+                    low=-3.0, high=3.0,
+                    shape=(self._n_actions, N_PLANET_FEATURES),
+                    dtype=np.float32,
+                ),
+                "global": spaces.Box(
+                    low=0.0, high=1.0,
+                    shape=shapes["global"],
+                    dtype=np.float32,
+                ),
+            })
+        else:
+            shapes = observation_shapes(_dummy_state, self.cfg.observation, self._n_actions)
+            self.observation_space = spaces.Dict({
+                "events": spaces.Box(
+                    low=-3.0, high=3.0,
+                    shape=shapes["events"],
+                    dtype=np.float32,
+                ),
+                "global": spaces.Box(
+                    low=0.0, high=1.0,
+                    shape=shapes["global"],
+                    dtype=np.float32,
+                ),
+            })
         self.action_space = spaces.Discrete(self._n_actions)
 
         # ---- episode state (initialised in reset) ----
@@ -243,15 +243,21 @@ class ArielEnv(gym.Env):
         super().reset(seed=seed)
 
         self._backend.reset()
-        self._state = MissionState.from_tables(
+        self._state = MissionState.from_backend(
             self._targets,
-            self._events,
+            backend=self._backend,
             mission_start=self.cfg.mission.start_bjd,
             mission_end=self.cfg.mission.start_bjd + self.cfg.mission.lifetime_days,
-            backend=self._backend,
         )
         self._step_count = 0
         self._milestones_hit = set()
+
+        # Pre-compute static planet features (time-invariant for the episode)
+        if (
+            self.cfg.action.type == "full_set"
+            and self.cfg.action.full_set.cache_static
+        ):
+            self._static_planet_features = build_static_features(self._state)
 
         # Reset relative-reward accumulators
         self._rel_interval_acc = 0.0
@@ -267,7 +273,7 @@ class ArielEnv(gym.Env):
 
         self._candidates, self._action_mask = self._get_candidates_and_mask()
 
-        obs = build_obs(self._state, self._candidates, self.cfg.observation)
+        obs = self._build_observation()
         info = self._make_info(step_result=None)
         return obs, info
 
@@ -278,7 +284,7 @@ class ArielEnv(gym.Env):
         if not mask[action]:
             # Invalid action — penalise and don't advance the clock
             penalty = -self.cfg.reward.invalid_action_penalty
-            obs = build_obs(self._state, self._candidates, self.cfg.observation)
+            obs = self._build_observation()
             info = self._make_info(step_result=None)
             info["invalid_action"] = True
             info["abs_reward"] = penalty
@@ -287,12 +293,17 @@ class ArielEnv(gym.Env):
         # Map action index → event_id
         event_id = self._action_to_event_id(action)
 
+        # Snapshot per-bin and per-host counts BEFORE executing the observation
+        # (needed to compute the marginal coverage and host-diversity rewards).
+        bin_observed_before = dict(self._state.population_bin_counts)
+        host_tier1_before   = self._host_tier1_counts()
+
         # Execute the observation in the simulator
         step_result = self._state.execute_observation(event_id)
         self._step_count += 1
 
         # ---- compute full absolute reward for this step ----
-        abs_reward = self._compute_reward(step_result)
+        abs_reward = self._compute_reward(step_result, bin_observed_before, host_tier1_before)
 
         # One-shot milestone bonus (fires when a T1 coverage threshold is crossed)
         n_total = self._state.total_targets
@@ -330,7 +341,7 @@ class ArielEnv(gym.Env):
         else:
             reward = abs_reward
 
-        obs = build_obs(self._state, self._candidates, self.cfg.observation)
+        obs = self._build_observation()
         info = self._make_info(step_result=step_result)
         info["abs_reward"] = abs_reward
         return obs, reward, terminated, False, info
@@ -345,6 +356,8 @@ class ArielEnv(gym.Env):
             return self._candidates_topk()
         elif self.cfg.action.type == "target":
             return self._candidates_target()
+        elif self.cfg.action.type == "full_set":
+            return self._candidates_full_set()
         else:
             raise ValueError(f"Unknown action type: {self.cfg.action.type!r}")
 
@@ -361,7 +374,7 @@ class ArielEnv(gym.Env):
             cols = candidates.columns if len(candidates) else pd.Index(
                 ["event_id", "target_id", "event_type",
                  "window_start", "window_mid", "window_end",
-                 "duration", "duration_days", "tier_goal",
+                 "duration", "duration_days", "block_duration_days", "tier_goal",
                  "base_science_value", "visibility_valid",
                  "ephemeris_uncertainty", "event_index"]
             )
@@ -371,16 +384,58 @@ class ArielEnv(gym.Env):
         mask = compute_mask(self._state, candidates, self.cfg.action)
         return candidates.reset_index(drop=True), mask
 
+    def _candidates_full_set(self) -> tuple[pd.DataFrame, np.ndarray]:
+        """Full-set mode: one next-event per target (same as _candidates_target),
+        but the observation returned to the agent uses the per-planet feature
+        matrix rather than the event-feature rows."""
+        return self._candidates_target()
+
     def _candidates_target(self) -> tuple[pd.DataFrame, np.ndarray]:
-        """One next-event per target, ordered to match target table index."""
-        rows = []
-        for _, trow in self._targets.iterrows():
-            tid = trow["target_id"]
-            nxt = self._state.next_event_for_target(tid)
-            if nxt is not None:
-                rows.append(nxt.to_dict())
-            else:
-                rows.append(_sentinel_event(tid, self._events.columns))
+        """One next-event per target, ordered to match target table index.
+
+        Works with both TableBackend (queries self.events) and DynamicBackend
+        (calls backend.candidates for a large window, then picks first per target).
+        """
+        from ariel_rl.simulator.event_backend import TableBackend
+        t_now = self._state.clock.current_time
+        n_targets = len(self._targets)
+
+        if isinstance(self._backend, TableBackend) and len(self._events) > 0:
+            # Original table-based path
+            rows = []
+            fallback_cols = self._events.columns
+            for _, trow in self._targets.iterrows():
+                tid = trow["target_id"]
+                nxt = self._state.next_event_for_target(tid)
+                if nxt is not None:
+                    rows.append(nxt.to_dict())
+                else:
+                    rows.append(_sentinel_event(tid, fallback_cols))
+        else:
+            # DynamicBackend path: fetch a large window and pick first per target
+            # Fetch 3× the target count to ensure coverage of all targets
+            pool = self._backend.candidates(t_now, n_targets * 3)
+            # Build target_id → first upcoming event mapping
+            seen: dict[str, dict] = {}
+            for _, ev in pool.iterrows():
+                tid = ev["target_id"]
+                if tid not in seen:
+                    seen[tid] = ev.to_dict()
+
+            fallback_cols = pd.Index(
+                ["event_id", "target_id", "event_type",
+                 "window_start", "window_mid", "window_end",
+                 "duration", "duration_days", "block_duration_days", "tier_goal",
+                 "base_science_value", "visibility_valid",
+                 "ephemeris_uncertainty", "event_index"]
+            )
+            rows = []
+            for _, trow in self._targets.iterrows():
+                tid = trow["target_id"]
+                if tid in seen:
+                    rows.append(seen[tid])
+                else:
+                    rows.append(_sentinel_event(tid, fallback_cols))
 
         candidates = pd.DataFrame(rows)
         mask = compute_mask(self._state, candidates, self.cfg.action)
@@ -433,7 +488,7 @@ class ArielEnv(gym.Env):
 
     def _action_to_event_id(self, action: int) -> int:
         """Convert an action index to an event_id in the event table."""
-        if self.cfg.action.type in ("topk", "target"):
+        if self.cfg.action.type in ("topk", "target", "full_set"):
             row = self._candidates.iloc[action]
             return int(row["event_id"])
         raise ValueError(f"Unknown action type: {self.cfg.action.type!r}")
@@ -442,16 +497,54 @@ class ArielEnv(gym.Env):
     # Reward
     # ------------------------------------------------------------------
 
-    def _compute_reward(self, step_result: dict) -> float:
+    def _build_observation(self) -> dict:
+        """Build the agent observation dict for the current state.
+
+        In ``full_set`` mode the observation contains ``"planets"`` (N × F)
+        and ``"global"``.  In ``topk`` / ``target`` modes it contains
+        ``"events"`` (K × E) and ``"global"``.
+        """
+        from ariel_rl.envs.observation_builder import _build_global
+        if self.cfg.action.type == "full_set":
+            planet_arr = build_planet_features(
+                self._state, self._static_planet_features
+            )
+            global_arr = _build_global(self._state, self.cfg.observation)
+            return {"planets": planet_arr, "global": global_arr}
+        return build_obs(self._state, self._candidates, self.cfg.observation)
+
+    def _compute_reward(
+        self,
+        step_result: dict,
+        bin_observed_before: dict[str, int] | None = None,
+        host_tier1_before: dict[str, int] | None = None,
+    ) -> float:
         """Compute the per-step reward for the current step using the rewards module."""
         if step_result is None:
             return 0.0
+        bin_observed_after = self._state.population_bin_counts
         return compute_reward(
             step_result=step_result,
             cfg=self.cfg.reward,
             bin_totals=self._state._bin_totals,
-            bin_observed=self._state.population_bin_counts,
+            bin_observed_before=bin_observed_before or bin_observed_after,
+            bin_observed_after=bin_observed_after,
+            host_tier1_counts=host_tier1_before,
         )
+
+    def _host_tier1_counts(self) -> dict[str, int]:
+        """Return a dict of {host_id: n_tier1_completed_targets} for the current state."""
+        counts: dict[str, int] = {}
+        if "host_id" not in self._targets.columns:
+            return counts
+        for tid, prog in self._state._progress_dict.items():
+            if int(prog.get("current_tier", 0)) >= 1:
+                target_row = self._state._target_lookup.get(tid)
+                if target_row is not None:
+                    hid = str(target_row.get("host_id", ""))
+                    if hid:
+                        counts[hid] = counts.get(hid, 0) + 1
+        return counts
 
     def _apply_relative_reward(self, abs_reward: float, terminated: bool) -> float:
         """Convert an absolute reward into a checkpoint-based relative reward.
@@ -563,7 +656,9 @@ def _make_padding_rows(n: int, columns: pd.Index) -> pd.DataFrame:
     dummy["event_id"] = [-1] * n
     dummy["target_id"] = [""] * n
     dummy["window_end"] = [0.0] * n
+    dummy["window_mid"] = [0.0] * n
     dummy["duration_days"] = [0.0] * n
+    dummy["block_duration_days"] = [0.0] * n
     dummy["duration"] = [0.0] * n
     return pd.DataFrame(dummy)[columns]
 
@@ -575,6 +670,8 @@ def _sentinel_event(target_id: str, columns: pd.Index) -> dict:
     row["event_id"] = -1
     row["visibility_valid"] = False
     row["window_end"] = 0.0
+    row["window_mid"] = 0.0
     row["duration_days"] = 0.0
+    row["block_duration_days"] = 0.0
     row["duration"] = 0.0
     return row
