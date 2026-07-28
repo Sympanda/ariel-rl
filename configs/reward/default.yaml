@@ -32,7 +32,7 @@
 #   t1_terminal_*            — end-of-episode bonus (quadratic in T1 fraction)
 #
 # Penalties:
-#   miss_penalty             — arrived after window_end
+#   miss_penalty             — arrived after block_end (= mid + 1.25×T14; partial-obs aware)
 #   invalid_action_penalty   — chose a masked action
 
 reward:

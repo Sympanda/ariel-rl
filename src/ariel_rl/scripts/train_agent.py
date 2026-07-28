@@ -73,21 +73,33 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Override MissionConfig.lifetime_days (curriculum lever).")
     env.add_argument("--max-tier-cap", type=int, default=None, choices=[1, 2, 3],
                      help="Override MissionConfig.max_tier_cap (curriculum lever).")
-    env.add_argument("--action-type", type=str, default=None, choices=["topk", "target"],
+    env.add_argument("--action-type", type=str, default=None,
+                     choices=["topk", "target", "full_set"],
                      help="Override action space type.")
+    env.add_argument("--n-max", type=int, default=None,
+                     help="full_set only: fixed action-space size N_max (0 = len(targets)).")
     env.add_argument("--topk-k", type=int, default=None,
                      help="Override top-k action space size (only for --action-type topk).")
 
     # ---- policy ----
     pol = p.add_argument_group("Policy")
-    pol.add_argument("--policy", type=str, default="transformer", choices=["transformer", "mlp"],
-                     help="Which policy architecture to use.")
+    pol.add_argument("--policy", type=str, default="transformer",
+                     choices=["transformer", "mlp", "full_set_isab", "full_set_attention"],
+                     help=(
+                         "Which policy architecture to use.\n"
+                         "  transformer       — Top-K Full Self-Attention (default baseline)\n"
+                         "  mlp               — flat MLP on top-K events\n"
+                         "  full_set_isab     — ISAB Set Transformer on all N planets (--action-type full_set)\n"
+                         "  full_set_attention — Full self-attention ablation on all N planets"
+                     ))
     pol.add_argument("--d-model", type=int, default=128,
                      help="Transformer hidden dim (ArielTransformerPolicy only).")
     pol.add_argument("--n-heads", type=int, default=4,
                      help="Attention heads — must divide d-model exactly.")
     pol.add_argument("--n-layers", type=int, default=3,
-                     help="Transformer encoder depth.")
+                     help="Transformer encoder depth (also ISAB stack depth).")
+    pol.add_argument("--n-inducing", type=int, default=32,
+                     help="ISAB inducing-point count (full_set_isab only).")
     pol.add_argument("--dropout", type=float, default=0.0,
                      help="Attention/FFN dropout (0 recommended for on-policy RL).")
     pol.add_argument("--hidden-sizes", type=int, nargs="+", default=[256, 256],
@@ -325,6 +337,10 @@ def _override_config(cfg, args):
         action_overrides["type"] = args.action_type
     if args.topk_k is not None:
         action_overrides["topk"] = dataclasses.replace(cfg.action.topk, k=args.topk_k)
+    if getattr(args, "n_max", None) is not None:
+        action_overrides["full_set"] = dataclasses.replace(
+            cfg.action.full_set, n_max=args.n_max
+        )
 
     new_mission = dataclasses.replace(cfg.mission, **mission_overrides) if mission_overrides else cfg.mission
     new_action  = dataclasses.replace(cfg.action,  **action_overrides)  if action_overrides  else cfg.action
@@ -343,6 +359,8 @@ def main() -> None:
     from ariel_rl.agents.ppo_masked import make_training_envs
     from ariel_rl.agents.policies.event_attention_policy import ArielTransformerPolicy
     from ariel_rl.agents.policies.mlp_scorer import ArielMlpPolicy
+    from ariel_rl.agents.policies.full_set_isab_policy import FullSetISABPolicy
+    from ariel_rl.agents.policies.full_set_attention_policy import FullSetSelfAttentionPolicy
     from ariel_rl.data.preprocess_targets import build_target_table
     from ariel_rl.utils.config import default_env_config, load_env_config, env_config_to_dict
 
@@ -366,22 +384,39 @@ def main() -> None:
         cfg = default_env_config()
         print("Config : defaults (no YAML supplied or file not found)")
 
-    # ---- optional reward overlay ----
-    if args.reward_config and args.reward_config.exists():
-        import yaml as _yaml
-        with open(args.reward_config) as _f:
+    # ---- reward config: auto-load default.yaml, then apply any explicit override ----
+    import yaml as _yaml
+    from dataclasses import fields as _fields
+
+    def _apply_reward_yaml(current_cfg, yaml_path: Path, label: str):
+        with open(yaml_path) as _f:
             _rdata = _yaml.safe_load(_f) or {}
-        # Accept both bare  {efficiency_weight: 0.0, ...}
-        # and wrapped        {reward: {efficiency_weight: 0.0, ...}}
         if "reward" in _rdata and isinstance(_rdata["reward"], dict):
             _rdata = _rdata["reward"]
-        from dataclasses import fields as _fields
-        _valid = {f.name for f in _fields(cfg.reward)}
+        _valid = {f.name for f in _fields(current_cfg.reward)}
         _kwargs = {k: v for k, v in _rdata.items() if k in _valid}
-        cfg = dataclasses.replace(cfg, reward=dataclasses.replace(cfg.reward, **_kwargs))
-        print(f"Reward : {args.reward_config}  ({len(_kwargs)} keys overridden)")
+        new_cfg = dataclasses.replace(
+            current_cfg, reward=dataclasses.replace(current_cfg.reward, **_kwargs)
+        )
+        print(f"Reward : {label}  ({len(_kwargs)} keys applied)")
+        return new_cfg
+
+    # 1. Auto-load the canonical default preset (single source of truth).
+    _default_reward_yaml = Path(__file__).parents[4] / "configs" / "reward" / "default.yaml"
+    if not _default_reward_yaml.exists():
+        # Fallback: look relative to CWD (for users running from the repo root)
+        _default_reward_yaml = Path("configs") / "reward" / "default.yaml"
+
+    if _default_reward_yaml.exists():
+        cfg = _apply_reward_yaml(cfg, _default_reward_yaml, str(_default_reward_yaml))
     else:
-        print("Reward : defaults (no --reward-config supplied)")
+        print("Reward : configs/reward/default.yaml not found — using dataclass defaults")
+
+    # 2. Explicit --reward-config overrides the defaults.
+    if args.reward_config and args.reward_config.exists():
+        cfg = _apply_reward_yaml(cfg, args.reward_config, f"{args.reward_config} (override)")
+    elif args.reward_config:
+        print(f"Reward : --reward-config {args.reward_config} not found — ignored")
 
     cfg = _override_config(cfg, args)
     print(f"  action.type      = {cfg.action.type}")
@@ -390,7 +425,10 @@ def main() -> None:
 
     # ---- pre-build shared tables ----
     print("\nBuilding shared target table …")
-    targets = build_target_table(args.csv_path)
+    targets = build_target_table(
+        args.csv_path,
+        science_weight_floor=cfg.reward.science_weight_floor,
+    )
     print(f"  {len(targets)} targets  (DynamicBackend — no event table needed)")
 
     # ---- output dirs ----
@@ -423,7 +461,33 @@ def main() -> None:
             "dropout":  args.dropout,
         }
         policy_desc = (
-            f"ArielTransformerPolicy "
+            f"ArielTransformerPolicy [Top-K full-attention] "
+            f"(d_model={args.d_model}, n_heads={args.n_heads}, n_layers={args.n_layers})"
+        )
+    elif args.policy == "full_set_isab":
+        policy_cls = FullSetISABPolicy
+        policy_kwargs = {
+            "d_model":       args.d_model,
+            "n_heads":       args.n_heads,
+            "n_isab_layers": args.n_layers,
+            "n_inducing":    args.n_inducing,
+            "dropout":       args.dropout,
+        }
+        policy_desc = (
+            f"FullSetISABPolicy [Full-set ISAB] "
+            f"(d_model={args.d_model}, n_heads={args.n_heads}, "
+            f"n_isab={args.n_layers}, n_inducing={args.n_inducing})"
+        )
+    elif args.policy == "full_set_attention":
+        policy_cls = FullSetSelfAttentionPolicy
+        policy_kwargs = {
+            "d_model":  args.d_model,
+            "n_heads":  args.n_heads,
+            "n_layers": args.n_layers,
+            "dropout":  args.dropout,
+        }
+        policy_desc = (
+            f"FullSetSelfAttentionPolicy [Full-set full-attention ablation] "
             f"(d_model={args.d_model}, n_heads={args.n_heads}, n_layers={args.n_layers})"
         )
     else:
@@ -485,6 +549,10 @@ def main() -> None:
 
     if args.policy == "transformer":
         n_params = sum(p.numel() for p in model.policy.transformer_net.parameters())
+    elif args.policy == "full_set_isab":
+        n_params = sum(p.numel() for p in model.policy.isab_net.parameters())
+    elif args.policy == "full_set_attention":
+        n_params = sum(p.numel() for p in model.policy.attn_net.parameters())
     else:
         n_params = sum(p.numel() for p in model.policy.mlp_net.parameters())
     print(f"  Policy parameters : {n_params:,}")

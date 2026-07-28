@@ -317,34 +317,47 @@ def build_planet_features(
         arr[i, n_static + 8] = slew          / _NORM["slew_norm"]
         arr[i, n_static + 9] = float(np.clip(slack, -1.0, 10.0)) / 10.0
 
-        # ---- future opportunity features ----
-        # Next three event mid-times computed from orbital parameters.
-        # (Always uses orbital params for the 2nd/3rd events regardless of backend.)
-        period  = float(row.get("period", 1.0)) or 1.0
-        epoch   = float(row.get("epoch", t_now))
-        phase   = (t_now - epoch) % period
-        mid0    = t_now + (period - phase)   # first mid after t_now (always future)
-        mids    = [mid0, mid0 + period, mid0 + 2 * period]
-        dts     = [m - t_now for m in mids]
+        # ---- future opportunity features (via backend — single source of truth) ----
+        # Ask the backend for the next 3 events for this target so that
+        # eclipse-only / either-type targets return the correct event type.
+        # Falls back to orbital-parameter reconstruction when no backend available.
+        period = float(row.get("period", 1.0)) or 1.0
+        future_events = state._backend.events_for_target(tid, t_now, n=3)
 
-        arr[i, n_static + 10] = min(dts[0], 365.25) / _NORM["dt_next_event_norm"]
-        arr[i, n_static + 11] = min(dts[1], 365.25) / _NORM["dt_second_event_norm"]
-        arr[i, n_static + 12] = min(dts[2], 365.25) / _NORM["dt_third_event_norm"]
+        # dt features: use backend events when available
+        for k_ev, slot in enumerate([10, 11, 12]):
+            if k_ev < len(future_events):
+                dt = max(0.0, float(future_events[k_ev]["window_mid"]) - t_now)
+            else:
+                dt = 365.25  # no further events → clip at normalisation ceiling
+            arr[i, n_static + slot] = min(dt, 365.25) / _NORM[
+                ["dt_next_event_norm", "dt_second_event_norm", "dt_third_event_norm"][k_ev]
+            ]
 
-        # block_duration from the backend event (or fallback)
-        arr[i, n_static + 13] = min(block_dur, 3.0) / _NORM["block_duration_norm"]
+        # block_duration: from the first backend event (or from immediate action ev)
+        if future_events:
+            bd_future = float(future_events[0].get("block_duration_days", block_dur))
+        else:
+            bd_future = block_dur
+        arr[i, n_static + 13] = min(bd_future, 3.0) / _NORM["block_duration_norm"]
 
         # Ephemeris uncertainty (fractional: σ_timing / period)
         unc_days = float(row.get("epoch_uncertainty", 0.0)) or 0.0
         arr[i, n_static + 14] = min(unc_days / period, 1.0)
 
-        # Remaining opportunities in mission
+        # Remaining opportunities: count future mid-times within mission / season.
+        # Use backend to count (estimate from period spacing when exact count unknown).
         avail_total = float(row.get("available_transits", 0)) or 1.0
-        remaining_mission = max(0.0, (mission_end - mid0) / period)
+        if future_events:
+            first_future_mid = float(future_events[0]["window_mid"])
+        else:
+            phase = (t_now - float(row.get("epoch", t_now))) % period
+            first_future_mid = t_now + (period - phase)
+
+        remaining_mission = max(0.0, (mission_end - first_future_mid) / period)
         arr[i, n_static + 15] = min(remaining_mission / avail_total, 1.0)
 
-        # Remaining opportunities in next 90-day season
-        remaining_season = max(0.0, (season_end - mid0) / period)
+        remaining_season = max(0.0, (season_end - first_future_mid) / period)
         arr[i, n_static + 16] = min(remaining_season, 10.0) / _NORM["remaining_opps_season_norm"]
 
     # Global clip to reasonable range

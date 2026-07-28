@@ -120,6 +120,12 @@ class FullSetActionConfig:
     """
     include_completed: bool = False
     cache_static: bool = True   # pre-compute static features at reset()
+    #: Fixed action-space size.  The observation is padded to (n_max, F) with
+    #: zero tokens so the policy sees a constant-shape input independent of
+    #: how many targets remain active.  Set to 0 to use len(targets) as-is
+    #: (backward-compatible default; no padding added).
+    #: For the full Ariel catalogue (~2000 targets) set n_max=2000.
+    n_max: int = 0
 
 
 @dataclass(frozen=True)

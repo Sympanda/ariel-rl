@@ -151,10 +151,18 @@ class ArielEnv(gym.Env):
         # ---- determine action space size ----
         if self.cfg.action.type == "topk":
             self._n_actions = self.cfg.action.topk.k
-        elif self.cfg.action.type in ("target", "full_set"):
+        elif self.cfg.action.type == "target":
             self._n_actions = len(self._targets)
+        elif self.cfg.action.type == "full_set":
+            cfg_n_max = self.cfg.action.full_set.n_max
+            # n_max=0 means "use len(targets)" (backward-compat).
+            # Otherwise use the configured cap, clamped so it is at least N.
+            self._n_actions = max(len(self._targets), cfg_n_max) if cfg_n_max > 0 else len(self._targets)
         else:
             raise ValueError(f"Unknown action type: {self.cfg.action.type!r}")
+
+        # Number of actual catalogue targets (may be ≤ _n_actions when padding active)
+        self._n_targets = len(self._targets)
 
         # ---- static per-planet feature cache (full_set mode) ----
         self._static_planet_features: np.ndarray | None = None
@@ -393,10 +401,25 @@ class ArielEnv(gym.Env):
         return candidates.reset_index(drop=True), mask
 
     def _candidates_full_set(self) -> tuple[pd.DataFrame, np.ndarray]:
-        """Full-set mode: one next-event per target (same as _candidates_target),
-        but the observation returned to the agent uses the per-planet feature
-        matrix rather than the event-feature rows."""
-        return self._candidates_target()
+        """Full-set mode: one next-event per target + padding to n_max.
+
+        The candidates DataFrame has exactly ``_n_actions`` rows:
+          - rows 0 … n_targets-1: real target events (or sentinels)
+          - rows n_targets … n_max-1: zero-padded sentinels (always mask=False)
+
+        This gives the ISAB policy a fixed-shape input regardless of how many
+        targets are active.
+        """
+        candidates, mask = self._candidates_target()
+
+        n_real = len(candidates)
+        if n_real < self._n_actions:
+            cols = candidates.columns
+            extra = _make_padding_rows(self._n_actions - n_real, cols)
+            candidates = pd.concat([candidates, extra], ignore_index=True)
+            mask = np.concatenate([mask, np.zeros(self._n_actions - n_real, dtype=bool)])
+
+        return candidates.reset_index(drop=True), mask
 
     def _candidates_target(self) -> tuple[pd.DataFrame, np.ndarray]:
         """One next-event per target, ordered to match target table index.
@@ -533,6 +556,13 @@ class ArielEnv(gym.Env):
                 self._static_planet_features,
                 per_target_events=per_target_events,
             )
+            # Pad to _n_actions rows with zeros when n_max > n_targets
+            n_real = planet_arr.shape[0]
+            if n_real < self._n_actions:
+                padding = np.zeros(
+                    (self._n_actions - n_real, N_PLANET_FEATURES), dtype=np.float32
+                )
+                planet_arr = np.concatenate([planet_arr, padding], axis=0)
             global_arr = _build_global(self._state, self.cfg.observation)
             return {"planets": planet_arr, "global": global_arr}
         return build_obs(self._state, self._candidates, self.cfg.observation)

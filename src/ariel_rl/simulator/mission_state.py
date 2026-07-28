@@ -342,7 +342,7 @@ class MissionState:
         tier_after    = int(self._progress_dict[target_id]["current_tier"])
         progress_after = float(self._progress_dict[target_id]["progress_in_tier"])
 
-        total_cost_days = slew_days + idle_days + obs_duration_days
+        total_cost_days = slew_days + idle_days + obs_duration_days + self.overhead_days_per_obs
 
         info = {
             "target_id":            target_id,

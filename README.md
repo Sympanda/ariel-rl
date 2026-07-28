@@ -118,7 +118,7 @@ The agent observation at each step is a dict of two arrays:
 
 *Static* (fixed per target): `base_science_value`, `science_weight`, `planet_radius`, `planet_temperature`, `planet_mass`, `stellar_temperature`, `stellar_metallicity`, `tier_goal`, `event_type`.
 
-*Dynamic* (update each step): `slew_time_days`, `window_urgency_norm`, `duration_days`, `block_duration_days` (= 2.5 × T₁₄), `total_time_cost_days` (slew + idle + **effective_fraction** × block_dur; reduced when near a tier boundary), `capture_fraction` (fraction of block still capturable if chosen now; 1 = full, <1 = late arrival), `progress_in_tier`, `obs_remaining_next_tier_norm`, `days_to_block_end_norm` (time to scheduling deadline `block_end = mid + 1.25 × T₁₄`; replaces `days_to_window_end_norm`).
+*Dynamic* (update each step): `slew_time_days`, `window_urgency_norm`, `duration_days`, `block_duration_days` (= 2.5 × T₁₄), `total_time_cost_days` (slew + idle + **effective_fraction** × block_dur + overhead; matches the physical clock advance), `capture_fraction` (fraction of block still capturable if chosen now; 1 = full, <1 = late arrival), `progress_in_tier`, `obs_remaining_next_tier_norm`, `days_to_block_end_norm` (time to scheduling deadline `block_end = mid + 1.25 × T₁₄`; replaces `days_to_window_end_norm`).
 
 **Global mission features** (`obs["global"]`, shape `G = 26`) — mission-level summary the same for all K candidates:
 
@@ -314,20 +314,31 @@ The transformer treats each of the K candidate events as a token and uses self-a
 * `full_set` action mask is more permissive: omits the budget-fit check, letting the agent decide whether a partial capture is worthwhile.
 * 22 new partial-observation tests covering Cases A, B, C, and accumulation.
 
-### 🔄 Phase 5: Policy improvement
+### ✅ Phase 5: Full-set policy architecture (Set Transformer / ISAB)
+
+* **FullSetISABPolicy** implemented — ISAB × 2 + PMA critic, O(N·m) attention scalable to ~2000 planets.
+* **FullSetSelfAttentionPolicy** implemented — full O(N²) attention ablation for direct comparison.
+* `N_max` padding: observation space is `(N_max, 28)` with zero-pad rows; action space `Discrete(N_max)`.
+* `events_for_target()` added to `DynamicBackend` — single source of truth for eclipse/either targets.
+* All three policies wired into `train_agent.py`:
+  `--policy transformer` (Top-K), `--policy full_set_isab`, `--policy full_set_attention`.
+
+Three-way comparison:
+
+| Policy | Action space | Attention |
+|---|---|---|
+| `ArielTransformerPolicy` | Top-K events | O(K²) full |
+| `FullSetSelfAttentionPolicy` | All N planets | O(N²) full |
+| `FullSetISABPolicy` | All N planets | O(N·m) ISAB |
+
+### 🔄 Phase 6: Policy improvement
 
 * Curriculum training: T1-only short episodes → full 3.5-year mission.
 * Offline pre-training from `SmartGreedy` rollouts → fine-tune with PPO.
 * Ablation: `efficiency_weight`, `diversity_multiplier_max`, tier bonus ratios.
 * Multi-seed evaluation with mean ± std reporting.
 
-### 🔲 Phase 6: Full-set policy architecture (Set Transformer / ISAB)
-
-* Implement ISAB-based Set Transformer policy for the `full_set` action space.
-* Permutation-equivariant processing of the full ~800-planet catalogue.
-* Train and compare against top-K transformer baseline.
-
-### 🔲 Phase 6: Science evaluation
+### 🔲 Phase 7: Science evaluation
 
 * Compare selected samples against desired population distributions.
 * Quantify coverage of planet radius, temperature, mass, density, stellar type, and metallicity.

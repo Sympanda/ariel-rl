@@ -78,13 +78,15 @@ def _mask_topk(state: "MissionState", events: pd.DataFrame) -> np.ndarray:
       1. visibility_valid is True
       2. Observation block hasn't fully elapsed (block_end > t_now)
       3. Telescope arrives before block_end (any non-zero capture possible)
-      4. Total cost (slew + idle + block_duration) fits in remaining mission time
+      4. Actual time cost (slew + idle + *captured* duration + overhead) fits in
+         remaining mission time — NOT full block duration
       5. Target has not yet reached max_tier
 
-    The miss threshold is ``block_end`` (not ``window_end``) to be consistent
-    with MissionState.execute_observation's partial-observation model: arriving
-    within the observation block but after the raw transit still yields a
-    partial capture.
+    The miss threshold is ``block_end`` (not ``window_end``) consistent with
+    MissionState.execute_observation's partial-observation model.  The can_fit
+    check uses the *captured* duration (i.e. ``capture_fraction × block_dur``)
+    so that a valid partial observation is never rejected simply because the
+    full 2.5×T14 block would not fit.
     """
     from ariel_rl.simulator.slew import slew_time_days
     from ariel_rl.data.schemas import COST_FACTOR
@@ -93,8 +95,9 @@ def _mask_topk(state: "MissionState", events: pd.DataFrame) -> np.ndarray:
     if n == 0:
         return np.zeros(0, dtype=bool)
 
-    t_now = state.clock.current_time
+    t_now    = state.clock.current_time
     remaining = state.clock.remaining_time
+    overhead = getattr(state, "overhead_days_per_obs", 0.0)
 
     # Extract columns once (avoids pandas per-row overhead)
     vis  = events["visibility_valid"].to_numpy(dtype=bool)
@@ -131,7 +134,14 @@ def _mask_topk(state: "MissionState", events: pd.DataFrame) -> np.ndarray:
         # Idle: wait for block_start if arrived early
         block_start = wmid[i] - bldur[i] / 2.0
         idle = max(0.0, block_start - t_arrive)
-        total_cost = slew + idle + bldur[i]
+        # Captured duration: mirrors execute_observation's three cases
+        if t_arrive <= block_start:
+            cap_frac = 1.0
+        else:
+            cap_frac = (bend[i] - t_arrive) / bldur[i]
+        captured_dur = cap_frac * bldur[i]
+        # can_fit uses actual captured duration + overhead, not full block
+        total_cost = slew + idle + captured_dur + overhead
         if total_cost > remaining:
             continue
         mask[i] = True
@@ -167,6 +177,7 @@ def _mask_target(
     n = len(next_events)
     mask = np.zeros(n, dtype=bool)
     t_now = state.clock.current_time
+    overhead = getattr(state, "overhead_days_per_obs", 0.0)
 
     for i, (_, ev) in enumerate(next_events.iterrows()):
         target_id = ev.get("target_id")
@@ -211,7 +222,13 @@ def _mask_target(
         if not permissive:
             block_start = wmid - block_dur / 2.0
             idle = max(0.0, block_start - t_arrive)
-            if not state.clock.can_fit(slew + idle + block_dur):
+            # Use actual captured duration (mirrors execute_observation)
+            if t_arrive <= block_start:
+                cap_frac = 1.0
+            else:
+                cap_frac = (block_end - t_arrive) / block_dur
+            captured_dur = cap_frac * block_dur
+            if not state.clock.can_fit(slew + idle + captured_dur + overhead):
                 continue
 
         mask[i] = True

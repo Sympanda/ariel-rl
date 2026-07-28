@@ -331,7 +331,9 @@ The telescope slews **immediately** after the action is chosen, then idles if it
 6.  Return info dict: {tier_before, tier_after, tier_completed, missed,
                        captured_fraction,  ← geometric (what the window offered)
                        effective_fraction, ← actual (capped at tier boundary)
-                       obs_duration_days, slew_days, idle_days, total_cost_days, …}
+                       obs_duration_days, slew_days, idle_days,
+                       total_cost_days,    ← slew + idle + obs_duration + overhead
+                       …}
 ```
 
 **Key design points:**
@@ -389,7 +391,7 @@ Wraps `MissionState` as a Gymnasium environment.  The sim and the env are **deli
 |---|---|---|
 | `topk` | `Discrete(K)` | Agent picks index 0…K-1 into the K upcoming events sorted by `window_mid`.  Default. |
 | `target` | `Discrete(N)` | Agent picks target index 0…N-1; env auto-schedules the next available event for that target |
-| `full_set` | `Discrete(N)` | Like `target` but the observation is a full per-planet feature matrix (`N × N_PLANET_FEATURES`) over all N targets rather than K events.  **Currently an observation-space scaffold**: the environment infrastructure is complete but a dedicated ISAB Set Transformer policy has not yet been implemented (see development roadmap).  The existing `ArielTransformerPolicy` can be used as a temporary full-attention baseline over N planet tokens. |
+| `full_set` | `Discrete(N_max)` | All N targets in a fixed-size padded observation `(N_max × N_PLANET_FEATURES)`.  `N_max` is configured via `action.full_set.n_max` (default = `len(targets)`; set to 2000 for the full Ariel catalogue).  Rows beyond the real target count are zero-padded.  Three policy architectures are available: **FullSetISABPolicy** (ISAB Set Transformer, O(N·m) attention), **FullSetSelfAttentionPolicy** (full O(N²) attention ablation), and the pre-existing **ArielTransformerPolicy** (designed for top-K events but usable as a quick baseline). |
 
 Selected via `config.action.type`.  Invalid actions are penalised with `reward = -invalid_action_penalty` (default −0.5) and do not advance the clock.
 
@@ -801,7 +803,10 @@ All agents are trained with **MaskablePPO** from `sb3-contrib`, which enforces a
 |---|---|
 | `agents/ppo_masked.py` | Masked-env factory: `make_masked_env()`, `make_training_envs()` |
 | `agents/rl_agent.py` | `RLAgentWrapper` — adapts a trained SB3 model to `BaselineAgent` interface |
-| `agents/policies/event_attention_policy.py` | `ArielTransformerPolicy` — transformer encoder over K candidate events |
+| `agents/policies/event_attention_policy.py` | `ArielTransformerPolicy` — Top-K full self-attention over K event tokens |
+| `agents/policies/full_set_isab_policy.py` | `FullSetISABPolicy` — ISAB Set Transformer over all N planet tokens (O(N·m)) |
+| `agents/policies/full_set_attention_policy.py` | `FullSetSelfAttentionPolicy` — full O(N²) self-attention ablation over all N planet tokens |
+| `agents/policies/isab_modules.py` | `MAB`, `ISAB`, `PMA` — Set Transformer primitives (Lee et al. 2019) |
 | `agents/policies/mlp_scorer.py` | `ArielMlpPolicy` — flat MLP baseline (sanity-check policy) |
 | `scripts/train_agent.py` | CLI training script with logging, device auto-detection, post-training plots |
 
@@ -839,9 +844,21 @@ obs["global"]  (G,)   ──┘
 
 Action logits are clipped to `−∞` for masked positions before the softmax.
 
+#### Policy architectures — three-way comparison
+
+Three policies are available, targeting different action spaces and computational trade-offs:
+
+| Policy | File | Action space | Observation tokens | Attention | CLI flag |
+|---|---|---|---|---|---|
+| `ArielTransformerPolicy` | `event_attention_policy.py` | `topk` | K event rows | O(K²) full | `--policy transformer` |
+| `FullSetSelfAttentionPolicy` | `full_set_attention_policy.py` | `full_set` | N_max planet rows | O(N²) full | `--policy full_set_attention` |
+| `FullSetISABPolicy` | `full_set_isab_policy.py` | `full_set` | N_max planet rows | O(N·m) ISAB | `--policy full_set_isab` |
+
+The `ArielTransformerPolicy` remains the Top-K baseline — it is not replaced.
+
 #### `ArielTransformerPolicy` (`policies/event_attention_policy.py`)
 
-The primary architecture.  Each of the K candidate events is treated as a token; a transformer encoder with multi-head self-attention processes the full set simultaneously, enabling the policy to reason about relative priorities across all candidates in a single pass.
+The Top-K baseline.  Each of the K candidate events is treated as a token; a transformer encoder with multi-head self-attention processes the full set simultaneously, enabling the policy to reason about relative priorities across all candidates in a single pass.
 
 ```
 obs["events"]  (K×18) → event_proj(18→d_model)  ─┐
@@ -1084,8 +1101,11 @@ src/ariel_rl/
 │   ├── rl_agent.py                 ← RLAgentWrapper (BaselineAgent adapter for SB3 models)
 │   └── policies/
 │       ├── __init__.py
-│       ├── event_attention_policy.py  ← ArielTransformerNet + ArielTransformerPolicy
-│       └── mlp_scorer.py              ← ArielMlpNet + ArielMlpPolicy
+│       ├── event_attention_policy.py   ← ArielTransformerNet + ArielTransformerPolicy (Top-K)
+│       ├── full_set_isab_policy.py     ← FullSetISABNet + FullSetISABPolicy (ISAB, O(N·m))
+│       ├── full_set_attention_policy.py← FullSetSelfAttentionNet + FullSetSelfAttentionPolicy (ablation)
+│       ├── isab_modules.py             ← MAB, ISAB, PMA (Set Transformer primitives)
+│       └── mlp_scorer.py               ← ArielMlpNet + ArielMlpPolicy (sanity check)
 │
 ├── scripts/
 │   ├── build_dataset.py            ← CLI: build + cache Parquet files

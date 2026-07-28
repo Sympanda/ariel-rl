@@ -193,10 +193,18 @@ target nodes (features per target)
        └─ used_idle_fraction in global obs
 6. ── Curriculum: T1-only → full tiers  ────────────────────────  Next step
 7. ── Offline pre-training from baselines  ─────────────────────  After curriculum settled
-8. ── Full-set action space (all N targets)  ───────────────────  Observation scaffold complete (full_set mode)
-       └─ per-planet feature matrix (N × N_PLANET_FEATURES = 28) implemented
+8. ── Full-set action space (all N targets)  ───────────────────  ✅ Done
+       └─ per-planet feature matrix (N_max × N_PLANET_FEATURES = 28) padded to N_max
        └─ immediate action-quality features (capture_fraction, idle, slew, block_end) added
-       └─ ISAB Set Transformer policy NOT YET implemented (deferred after Items 1–10 fixes)
+       └─ events_for_target() on DynamicBackend — single source of truth for eclipse/either targets
+       └─ FullSetISABPolicy implemented  (ISAB × 2 + PMA critic, O(N·m) attention)
+       └─ FullSetSelfAttentionPolicy implemented  (full O(N²) ablation for comparison)
+       └─ Both wired into train_agent.py (--policy full_set_isab / full_set_attention)
+
+Three-way comparison now possible:
+    Top-K full attention      (--policy transformer       --action-type topk)
+    Full-set full attention   (--policy full_set_attention --action-type full_set)
+    Full-set ISAB             (--policy full_set_isab      --action-type full_set)
 9. ── Hierarchical or GNN extensions  ──────────────────────────  Research direction
 ```
 

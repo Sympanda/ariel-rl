@@ -105,6 +105,37 @@ class EventBackend(ABC):
         """Reset any per-episode mutable state (e.g. sliding-window pointer)."""
         ...
 
+    def events_for_target(
+        self,
+        target_id: str,
+        t_now: float,
+        n: int = 3,
+    ) -> list[dict]:
+        """Return the next *n* event dicts for a specific target starting from *t_now*.
+
+        This is the single source of truth for future-event timing features in
+        ``planet_feature_builder``.  The first returned event is always the same
+        occurrence that would be executed if this target were selected right now
+        (consistent with ``candidates()``).
+
+        Parameters
+        ----------
+        target_id:
+            Identifier of the target to look up.
+        t_now:
+            Current mission time (BJD).
+        n:
+            How many successive events to return.
+
+        Returns
+        -------
+        list of dicts, each containing at minimum:
+            ``window_mid``, ``block_duration_days``, ``event_type``.
+        Missing events (e.g. beyond mission end) are represented as empty dicts.
+        The default implementation returns an empty list; override in subclasses.
+        """
+        return []
+
 
 # ---------------------------------------------------------------------------
 # TableBackend
@@ -170,6 +201,36 @@ class TableBackend(EventBackend):
     def get_event(self, event_id: int) -> pd.Series:
         return self._events_idx.loc[event_id]
 
+    def events_for_target(
+        self,
+        target_id: str,
+        t_now: float,
+        n: int = 3,
+    ) -> list[dict]:
+        """Return the next n events for *target_id* from the pre-computed table."""
+        if len(self._events) == 0:
+            return []
+        from ariel_rl.data.schemas import COST_FACTOR
+        sub = self._events[self._events["target_id"] == target_id]
+        # Find events whose block hasn't ended yet
+        if "block_duration_days" in sub.columns:
+            block_ends = sub["window_mid"] + sub["block_duration_days"] / 2.0
+        else:
+            block_ends = sub["window_mid"] + COST_FACTOR * sub["duration_days"] / 2.0
+        sub = sub[block_ends > t_now].sort_values("window_mid")
+        out = []
+        for _, row in sub.head(n).iterrows():
+            bd = float(row.get("block_duration_days", COST_FACTOR * row["duration_days"]))
+            out.append({
+                "window_mid":          float(row["window_mid"]),
+                "window_start":        float(row["window_start"]),
+                "window_end":          float(row["window_end"]),
+                "duration_days":       float(row["duration_days"]),
+                "block_duration_days": bd,
+                "event_type":          str(row.get("event_type", "transit")),
+            })
+        return out
+
     def reset(self) -> None:
         pass  # Stateless: no per-episode mutable data.
 
@@ -211,6 +272,10 @@ class DynamicBackend(EventBackend):
 
         n = len(targets)
         self._target_ids: np.ndarray = targets["target_id"].to_numpy()
+        # Reverse index: target_id → array index (for events_for_target)
+        self._tid_to_idx: dict[str, int] = {
+            tid: i for i, tid in enumerate(self._target_ids)
+        }
 
         # Orbital parameters (all in days).
         self._epochs  = targets["epoch"].to_numpy(dtype=float)
@@ -390,6 +455,100 @@ class DynamicBackend(EventBackend):
                 "candidates() must be called before get_event() each step."
             )
         return pd.Series(self._event_cache[event_id])
+
+    def events_for_target(
+        self,
+        target_id: str,
+        t_now: float,
+        n: int = 3,
+    ) -> list[dict]:
+        """Return the next *n* events for *target_id* starting from *t_now*.
+
+        Respects ``preferred_method``: transit-only targets return only transit
+        events; eclipse-only targets return only eclipse events; either-type
+        targets interleave the nearest events from both.
+
+        The first event is always the current occurrence if the block is still
+        open (consistent with ``candidates()``), or the next future occurrence.
+        """
+        idx = self._tid_to_idx.get(target_id)
+        if idx is None:
+            return []
+
+        period    = float(self._periods[idx])
+        cf        = self._cost_factor
+
+        events_out: list[dict] = []
+
+        def _next_mids_from(epoch: float, half_event: float, n_events: int) -> list[float]:
+            """Return next n_events mid-times at or after t_now."""
+            half_block = half_event * cf
+            phase      = (t_now - epoch) % period
+            if phase < half_block:                  # still inside current block
+                first_mid = t_now - phase
+            else:
+                first_mid = t_now + (period - phase)
+            return [first_mid + k * period for k in range(n_events)]
+
+        want_transit = self._has_transit[idx]
+        want_eclipse = self._has_eclipse[idx]
+
+        if want_transit and not want_eclipse:
+            mids = _next_mids_from(
+                self._epochs[idx], self._half_tr[idx], n
+            )
+            dur_s    = float(self._tr_dur_s[idx])
+            dur_days = float(self._tr_dur_days[idx])
+            for mid in mids:
+                events_out.append({
+                    "window_mid":          mid,
+                    "window_start":        mid - self._half_tr[idx],
+                    "window_end":          mid + self._half_tr[idx],
+                    "duration_days":       dur_days,
+                    "block_duration_days": cf * dur_days,
+                    "event_type":          "transit",
+                })
+        elif want_eclipse and not want_transit:
+            ec_epoch = self._epochs[idx] + period / 2.0
+            mids = _next_mids_from(ec_epoch, self._half_ec[idx], n)
+            dur_s    = float(self._ec_dur_s[idx])
+            dur_days = float(self._ec_dur_days[idx])
+            for mid in mids:
+                events_out.append({
+                    "window_mid":          mid,
+                    "window_start":        mid - self._half_ec[idx],
+                    "window_end":          mid + self._half_ec[idx],
+                    "duration_days":       dur_days,
+                    "block_duration_days": cf * dur_days,
+                    "event_type":          "eclipse",
+                })
+        elif want_transit and want_eclipse:
+            # Interleave both types; return the n nearest.
+            tr_mids = _next_mids_from(
+                self._epochs[idx], self._half_tr[idx], n
+            )
+            ec_epoch = self._epochs[idx] + period / 2.0
+            ec_mids = _next_mids_from(ec_epoch, self._half_ec[idx], n)
+
+            tr_dur_days = float(self._tr_dur_days[idx])
+            ec_dur_days = float(self._ec_dur_days[idx])
+
+            combined = (
+                [(m, "transit", self._half_tr[idx], tr_dur_days) for m in tr_mids]
+                + [(m, "eclipse", self._half_ec[idx], ec_dur_days) for m in ec_mids]
+            )
+            combined.sort(key=lambda x: x[0])
+            for mid, etype, half_raw, dur_d in combined[:n]:
+                events_out.append({
+                    "window_mid":          mid,
+                    "window_start":        mid - half_raw,
+                    "window_end":          mid + half_raw,
+                    "duration_days":       dur_d,
+                    "block_duration_days": cf * dur_d,
+                    "event_type":          etype,
+                })
+        # If neither (target has no valid events), return empty list
+        return events_out[:n]
 
     def reset(self) -> None:
         self._event_cache.clear()
