@@ -131,7 +131,10 @@ class ArielEnv(gym.Env):
         if targets is not None:
             self._targets = targets.copy()
         else:
-            self._targets = build_target_table(csv_path)
+            self._targets = build_target_table(
+                csv_path,
+                science_weight_floor=self.cfg.reward.science_weight_floor,
+            )
 
         # Apply global max_tier_cap: clip each target's max_tier downward.
         cap = self.cfg.mission.max_tier_cap
@@ -248,6 +251,7 @@ class ArielEnv(gym.Env):
             backend=self._backend,
             mission_start=self.cfg.mission.start_bjd,
             mission_end=self.cfg.mission.start_bjd + self.cfg.mission.lifetime_days,
+            overhead_days_per_obs=self.cfg.mission.overhead_days_per_obs,
         )
         self._step_count = 0
         self._milestones_hit = set()
@@ -319,10 +323,14 @@ class ArielEnv(gym.Env):
         terminated = self._state.is_done()
         self._candidates, self._action_mask = self._get_candidates_and_mask()
 
-        # If no valid actions remain, try advancing the window by looking further
-        # ahead (up to _MAX_SKIP_ATTEMPTS) rather than terminating immediately.
+        # If no valid actions remain, try to recover a feasible action set.
+        # For topk: ask the backend for a larger window (the K nearest events
+        #   may all be expired; looking further ahead usually finds a valid one).
+        # For target/full_set: candidates are fixed (one per target) — if none
+        #   are valid the episode terminates; no lookahead is attempted.
         if not terminated and not any_valid(self._action_mask):
-            self._candidates, self._action_mask = self._skip_to_next_feasible()
+            if self.cfg.action.type == "topk":
+                self._candidates, self._action_mask = self._skip_to_next_feasible_topk()
 
         if not terminated and not any_valid(self._action_mask):
             terminated = True
@@ -441,15 +449,20 @@ class ArielEnv(gym.Env):
         mask = compute_mask(self._state, candidates, self.cfg.action)
         return candidates.reset_index(drop=True), mask
 
-    def _skip_to_next_feasible(
+    def _skip_to_next_feasible_topk(
         self, max_lookahead: int = 10
     ) -> tuple[pd.DataFrame, np.ndarray]:
-        """When the current k candidates are all infeasible, look further ahead.
+        """Top-K mode only: look further ahead when all K candidates are expired.
 
         Progressively asks the backend for larger candidate windows until a
         valid action is found or ``max_lookahead`` attempts are exhausted.
         The clock does NOT advance here — it advances only when the agent
         executes the chosen action via ``execute_observation``.
+
+        This method must NOT be called in ``target`` or ``full_set`` modes
+        because those modes return exactly one candidate per target and there
+        is no "larger window" concept.  An all-invalid mask in those modes
+        means the episode should terminate.
         """
         k = self.cfg.action.topk.k
         t_now = self._state.clock.current_time
@@ -506,8 +519,19 @@ class ArielEnv(gym.Env):
         """
         from ariel_rl.envs.observation_builder import _build_global
         if self.cfg.action.type == "full_set":
+            # Build a target_id → event dict from the pre-computed candidates so
+            # planet tokens describe exactly the event that would execute.
+            per_target_events: dict[str, dict] | None = None
+            if self._candidates is not None and len(self._candidates) > 0:
+                per_target_events = {}
+                for _, row in self._candidates.iterrows():
+                    tid = str(row["target_id"])
+                    if tid not in per_target_events:
+                        per_target_events[tid] = row.to_dict()
             planet_arr = build_planet_features(
-                self._state, self._static_planet_features
+                self._state,
+                self._static_planet_features,
+                per_target_events=per_target_events,
             )
             global_arr = _build_global(self._state, self.cfg.observation)
             return {"planets": planet_arr, "global": global_arr}

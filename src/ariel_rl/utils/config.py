@@ -151,7 +151,7 @@ ALL_EVENT_FEATURES: list[str] = [
     "stellar_metallicity",            # [Fe/H] (negative values allowed)
     "tier_goal_norm",                 # tier_goal / 3
     "event_type_binary",              # 0 = transit, 1 = eclipse
-    "days_to_window_end_norm",        # (window_end - t_now) / 30 days
+    "days_to_block_end_norm",         # (block_end - t_now) days; block_end = mid + 1.25×T14
 ]
 
 ALL_GLOBAL_FEATURES: list[str] = [

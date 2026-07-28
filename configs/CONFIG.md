@@ -95,7 +95,7 @@ action:
 | Field | Default | Status | Effect |
 |---|---|---|---|
 | `type` | `"topk"` | ✅ | Selects the action space. `"topk"` — K next events; `"target"` — all N targets (env picks next event per target); `"full_set"` — all N targets with full per-planet feature matrix. |
-| `topk.k` | `50` | ✅ | Size of the candidate window. The transformer sees a `(K × 17)` events matrix. Smaller K = narrower view but faster; larger K = wider scheduling horizon. |
+| `topk.k` | `50` | ✅ | Size of the candidate window. The transformer sees a `(K × 18)` events matrix. Smaller K = narrower view but faster; larger K = wider scheduling horizon. |
 | `topk.sort_by` | `"window_mid"` | ❌ Dead | Backends always sort by `window_mid` internally; this value is never passed through. |
 | `target.include_completed` | `False` | ⚠️ Partial | Only applies when `type="target"` or `"full_set"`. If `False`, targets that have reached `max_tier` are masked out. |
 | `full_set.cache_static` | `True` | ✅ | Pre-compute static planet features at `reset()` and recompute only dynamic features each step. Saves ~2 ms/step on the full catalogue. |
@@ -128,7 +128,7 @@ observation:
     - stellar_metallicity
     - tier_goal_norm
     - event_type_binary
-    - days_to_window_end_norm
+    - days_to_block_end_norm
   global_features:
     - fraction_elapsed
     - tier1_fraction
@@ -178,9 +178,9 @@ Each of the K candidate events contributes one row.  Rows beyond the real event 
 | `capture_fraction` | already [0,1] | **Fraction of the observation block capturable if chosen now.** 1.0 = arrive before block_start (full), <1 = arrive mid-block (partial). |
 | `progress_in_tier` | already [0,1] | Equivalent obs fraction completed toward the **next** tier boundary (float). |
 | `obs_remaining_next_tier_norm` | ÷ per-target max | Equivalent obs still needed (float), normalised for cross-target comparability. |
-| `days_to_window_end_norm` | ÷ 2 days | `window_end − t_now`. Absolute urgency; small = act now. |
+| `days_to_block_end_norm` | ÷ 5 days | `block_end − t_now` where `block_end = mid + 1.25 × T₁₄`. The correct scheduling deadline; an event is still capturable until block_end, not just window_end. |
 
-> **Removed** (vs original design): `wait_time_days` (83% zeros → superseded by `window_urgency_norm`), `is_valid` (constant 1 → replaced by `days_to_window_end_norm`).
+> **Removed** (vs original design): `wait_time_days` (83% zeros → superseded by `window_urgency_norm`), `is_valid` (constant 1 → replaced by `days_to_block_end_norm`), `days_to_window_end_norm` (used raw transit end; replaced by `days_to_block_end_norm`).
 
 ### Global features (`obs["global"]`, shape `G = 26`)
 

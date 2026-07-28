@@ -193,7 +193,10 @@ target nodes (features per target)
        └─ used_idle_fraction in global obs
 6. ── Curriculum: T1-only → full tiers  ────────────────────────  Next step
 7. ── Offline pre-training from baselines  ─────────────────────  After curriculum settled
-8. ── Full-set action space (all N targets)  ───────────────────  Partially implemented (full_set mode)
+8. ── Full-set action space (all N targets)  ───────────────────  Observation scaffold complete (full_set mode)
+       └─ per-planet feature matrix (N × N_PLANET_FEATURES = 28) implemented
+       └─ immediate action-quality features (capture_fraction, idle, slew, block_end) added
+       └─ ISAB Set Transformer policy NOT YET implemented (deferred after Items 1–10 fixes)
 9. ── Hierarchical or GNN extensions  ──────────────────────────  Research direction
 ```
 
@@ -270,8 +273,8 @@ The Ariel target list will be revised as TESS and ground-based surveys discover 
 | | New targets added mid-mission | Feature count changes |
 |---|---|---|
 | **Greedy baselines** | ✅ Trivial — targets just appear in the candidate set at the next step | ✅ Trivial — score formula is hand-coded |
-| **Transformer** | ✅ Easy — new event tokens are extra rows in the `(K×16)` input. The attention mechanism is permutation-equivariant and doesn't care about set size. Zero-padding already handles variable counts. Policy generalises immediately. | ⚠️ Retrain needed if feature count (16 or 25) changes, but not if only N_targets changes |
-| **MLP** | ❌ Hard — input is `K×16` *flattened*, so if K or the feature count changes the input dimension changes and the model must be retrained from scratch | ❌ Same problem |
+| **Transformer** | ✅ Easy — new event tokens are extra rows in the `(K×18)` input. The attention mechanism is permutation-equivariant and doesn't care about set size. Zero-padding already handles variable counts. Policy generalises immediately. | ⚠️ Retrain needed if feature count (18 or G) changes, but not if only N_targets changes |
+| **MLP** | ❌ Hard — input is `K×18` *flattened*, so if K or the feature count changes the input dimension changes and the model must be retrained from scratch | ❌ Same problem |
 
 This is one of the strongest practical arguments for the transformer over MLP for this specific problem. A production Ariel scheduler will need to absorb catalogue updates without full retraining, and the transformer's set-input architecture supports this directly.
 

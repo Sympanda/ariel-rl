@@ -206,7 +206,7 @@ class DynamicBackend(EventBackend):
 
     def __init__(self, targets: pd.DataFrame) -> None:
         from ariel_rl.simulator.event_generator import _base_science_value
-        from ariel_rl.data.schemas import METHOD_ECLIPSE, METHOD_EITHER, COST_FACTOR
+        from ariel_rl.data.schemas import METHOD_ECLIPSE, METHOD_EITHER, METHOD_TRANSIT, COST_FACTOR
         self._cost_factor: float = COST_FACTOR
 
         n = len(targets)
@@ -231,12 +231,19 @@ class DynamicBackend(EventBackend):
         self._ec_dur_days = ec_dur_s / 86400.0
         self._half_ec     = self._ec_dur_days / 2.0
 
-        # Which targets observe eclipses?
+        # Which targets observe transits vs eclipses?
+        # preferred_method == "Transit"  → transits only
+        # preferred_method == "Eclipse"  → eclipses only
+        # preferred_method == "Either"   → both (or anything unrecognised)
         preferred = (
             targets["preferred_method"]
             if "preferred_method" in targets.columns
-            else pd.Series(["transit"] * n)
+            else pd.Series([METHOD_TRANSIT] * n)
         )
+        # Eclipse-only targets must NOT produce a transit candidate.
+        has_tr_method = ~preferred.isin([METHOD_ECLIPSE]).to_numpy()
+        self._has_transit = has_tr_method & np.isfinite(tr_dur_s) & (tr_dur_s > 0)
+
         has_ec_method = preferred.isin([METHOD_ECLIPSE, METHOD_EITHER]).to_numpy()
         self._has_eclipse = has_ec_method & np.isfinite(ec_dur_s) & (ec_dur_s > 0)
 
@@ -267,23 +274,40 @@ class DynamicBackend(EventBackend):
     def candidates(self, t_now: float, k: int) -> pd.DataFrame:
         periods = self._periods
 
+        cf = self._cost_factor   # = 2.5; block extends 1.25 × T14 on each side
+
         # ---- Transits ----
-        tr_phase  = (t_now - self._epochs) % periods
-        in_tr     = tr_phase < self._half_tr
-        tr_center = np.where(in_tr, t_now - tr_phase, t_now + (periods - tr_phase))
-        tr_wend   = tr_center + self._half_tr
-        tr_ok     = self._has_transit & (tr_wend > t_now)
+        tr_phase      = (t_now - self._epochs) % periods
+        in_tr_raw     = tr_phase < self._half_tr          # inside raw T14 window
+        # The observation block extends to mid + cf/2 × T14 = mid + 1.25 × T14.
+        # A transit is still usable (partial capture possible) until block_end.
+        # We also need to include transits whose block has started but T14 hasn't
+        # ended yet, so we check the block_end rather than window_end.
+        half_tr_block = self._half_tr * cf                # = 1.25 × T14
+        in_tr_block   = tr_phase < half_tr_block          # inside block
+        tr_center     = np.where(
+            in_tr_block,
+            t_now - tr_phase,                              # current occurrence
+            t_now + (periods - tr_phase),                  # next occurrence
+        )
+        tr_block_end  = tr_center + half_tr_block
+        tr_ok         = self._has_transit & (tr_block_end > t_now)
 
         # ---- Eclipses (centred at epoch + period/2 for circular orbits) ----
-        ec_epoch  = self._epochs + periods / 2.0
-        ec_phase  = (t_now - ec_epoch) % periods
-        in_ec     = ec_phase < self._half_ec
-        ec_center = np.where(in_ec, t_now - ec_phase, t_now + (periods - ec_phase))
-        ec_wend   = ec_center + self._half_ec
-        ec_ok     = self._has_eclipse & (ec_wend > t_now)
+        ec_epoch      = self._epochs + periods / 2.0
+        ec_phase      = (t_now - ec_epoch) % periods
+        half_ec_block = self._half_ec * cf
+        in_ec_block   = ec_phase < half_ec_block
+        ec_center     = np.where(
+            in_ec_block,
+            t_now - ec_phase,
+            t_now + (periods - ec_phase),
+        )
+        ec_block_end  = ec_center + half_ec_block
+        ec_ok         = self._has_eclipse & (ec_block_end > t_now)
 
-        tr_idx = np.where(tr_ok)[0]
-        ec_idx = np.where(ec_ok)[0]
+        tr_idx = np.where(tr_ok)[0]   # indices of valid transit targets
+        ec_idx = np.where(ec_ok)[0]   # indices of valid eclipse targets
         n_tr, n_ec = len(tr_idx), len(ec_idx)
         n_total = n_tr + n_ec
 
@@ -309,18 +333,18 @@ class DynamicBackend(EventBackend):
 
         for rank in order:
             if rank < n_tr:
-                i    = int(tr_idx[rank])
-                eid  = i * 2
-                half = self._half_tr[i]
-                mid  = tr_center[i]
+                i        = int(tr_idx[rank])
+                eid      = i * 2
+                half_raw = self._half_tr[i]           # T14/2 (raw transit half)
+                mid      = tr_center[i]
                 dur_days = self._tr_dur_days[i]
                 rec  = {
                     "event_id":              eid,
                     "target_id":             self._target_ids[i],
                     "event_type":            "transit",
-                    "window_start":          mid - half,
+                    "window_start":          mid - half_raw,
                     "window_mid":            mid,
-                    "window_end":            mid + half,
+                    "window_end":            mid + half_raw,  # raw transit end
                     "duration":              self._tr_dur_s[i],
                     "duration_days":         dur_days,
                     "block_duration_days":   self._cost_factor * dur_days,
@@ -331,19 +355,19 @@ class DynamicBackend(EventBackend):
                     "event_index":           -1,
                 }
             else:
-                j    = int(rank - n_tr)
-                i    = int(ec_idx[j])
-                eid  = i * 2 + 1
-                half = self._half_ec[i]
-                mid  = ec_center[i]
+                j        = int(rank - n_tr)
+                i        = int(ec_idx[j])
+                eid      = i * 2 + 1
+                half_raw = self._half_ec[i]
+                mid      = ec_center[i]
                 dur_days = self._ec_dur_days[i]
                 rec  = {
                     "event_id":              eid,
                     "target_id":             self._target_ids[i],
                     "event_type":            "eclipse",
-                    "window_start":          mid - half,
+                    "window_start":          mid - half_raw,
                     "window_mid":            mid,
-                    "window_end":            mid + half,
+                    "window_end":            mid + half_raw,  # raw eclipse end
                     "duration":              self._ec_dur_s[i],
                     "duration_days":         dur_days,
                     "block_duration_days":   self._cost_factor * dur_days,

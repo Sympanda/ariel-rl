@@ -71,10 +71,16 @@ class MissionClock:
 
     @property
     def fraction_elapsed(self) -> float:
-        """Fraction of mission lifetime consumed (0–1)."""
-        if MISSION_LIFETIME_DAYS <= 0:
+        """Fraction of mission lifetime consumed (0–1).
+
+        Uses the *actual* ``mission_end – mission_start`` rather than a global
+        constant so curriculum episodes with shorter horizons are handled
+        correctly.
+        """
+        mission_length = self.mission_end - self.mission_start
+        if mission_length <= 0:
             return 1.0
-        return float(self.elapsed_time / MISSION_LIFETIME_DAYS)
+        return min(1.0, float(self.elapsed_time / mission_length))
 
     @property
     def mission_over(self) -> bool:

@@ -23,6 +23,7 @@ from ariel_rl.data.population_bins import assign_population_bins
 def build_target_table(
     csv_path: str | Path | None = None,
     min_available_obs: int = 1,
+    science_weight_floor: float = 0.3,
 ) -> pd.DataFrame:
     """Load, clean, and enrich the MCS catalogue.
 
@@ -75,7 +76,7 @@ def build_target_table(
     # ------------------------------------------------------------------
     # Population bins + science weights
     # ------------------------------------------------------------------
-    df = assign_population_bins(df)
+    df = assign_population_bins(df, science_weight_floor=science_weight_floor)
 
     # ------------------------------------------------------------------
     # Observation costs

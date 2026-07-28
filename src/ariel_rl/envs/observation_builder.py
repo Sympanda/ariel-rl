@@ -55,7 +55,7 @@ _NORM = {
     "total_time_cost_days":         3.0,         # slew + idle + block; max ~3 days
     "capture_fraction":             1.0,         # already in [0, 1]
     "obs_remaining_next_tier_norm": 1.0,         # already normalised
-    "days_to_window_end_norm":      2.0,         # window end within ~2-day lookahead for k=50
+    "days_to_block_end_norm":       5.0,         # block_end within ~5-day lookahead for k=50
     "planet_radius_norm":           20.0,        # Re (Jupiter ~11 Re)
     "planet_temperature_norm":      3000.0,      # K
     "planet_mass_norm":             4000.0,      # Earth masses (10 MJup)
@@ -149,13 +149,15 @@ def _build_event_row(
     else:
         capture_fraction = (block_end - t_arrive) / block_dur
 
-    # Window urgency: fraction of the transit window already elapsed.
+    # Window urgency: fraction of the raw transit window already elapsed.
     # 0 = window just opened, approaching 1 = window nearly closed.
     window_dur = max(window_end - window_start, 1e-6)
     window_urgency = max(0.0, (t_now - window_start) / window_dur)
 
-    # Time remaining until the window closes (absolute).
-    days_to_wend = max(0.0, window_end - t_now)
+    # Time remaining until the observation *block* closes (block_end, not window_end).
+    # This is the correct scheduling deadline: the agent can still partially
+    # capture the observation as long as block_end > t_now.
+    days_to_block_end = max(0.0, block_end - t_now)
 
     # Progress for this target — use fast dict instead of pandas .loc
     prog_row = state._progress_dict.get(target_id)
@@ -199,7 +201,7 @@ def _build_event_row(
         "stellar_metallicity":          float(target["stellar_metallicity"]) if target is not None and pd.notna(target["stellar_metallicity"]) else 0.0,
         "tier_goal_norm":               float(ev.get("tier_goal", 1)) / 3.0,
         "event_type_binary":            1.0 if ev.get("event_type") == "eclipse" else 0.0,
-        "days_to_window_end_norm":      days_to_wend,
+        "days_to_block_end_norm":       days_to_block_end,
     }
 
     row = np.array([values.get(f, 0.0) for f in cfg.event_features], dtype=np.float32)

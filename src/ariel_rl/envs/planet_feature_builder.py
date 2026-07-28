@@ -6,6 +6,16 @@ step.  This is the authoritative feature specification for Phase 3 (full
 target-set observation space), where the agent sees all N planets rather
 than a top-K slice.
 
+Single source-of-truth
+----------------------
+Dynamic event timing (dt_next_event, block_duration, slew, slack,
+capture_fraction, …) is derived from the same event that would be
+*executed* if this planet were selected.  When ``per_target_events`` is
+provided (from ``_candidates_target()``), those pre-computed events are
+used directly.  When omitted (e.g. in tests), ephemeris is computed
+independently from orbital parameters — but this path is slower and may
+differ from what the backend returns if a partial block is still ongoing.
+
 Feature schema (per planet)
 ---------------------------
 Static (time-invariant)
@@ -26,12 +36,20 @@ Dynamic (updated each step)
   progress_in_tier                current progress toward next tier [0, 1]
   current_tier_norm               current_tier / 3
   obs_remaining_norm              obs_remaining_next_tier / tier3_required_obs
-  dt_next_event_norm              Δt to next transit/eclipse / 365.25 days
+
+Immediate action-quality (from the event that would be executed right now)
+  capture_fraction_now            fraction of the observation block capturable
+  block_currently_active          1 if the observation block is open right now
+  time_to_block_end_norm          (block_end - t_now) / 10 days
+  idle_if_selected_norm           idle wait if selected now / (2hr/24)
+  slew_norm                       slew time from current pointing / (2hr/24)
+  scheduling_slack_norm           (block_start - t_arrive) / block_duration
+
+Future opportunity features (from next 1–3 events)
+  dt_next_event_norm              Δt to next event / 365.25 days
   dt_second_event_norm            Δt to second event / 365.25 days
   dt_third_event_norm             Δt to third event / 365.25 days
   block_duration_norm             block_duration_days (next event) / 3.0
-  slew_norm                       slew time from current pointing / (2hr/24)
-  scheduling_slack_norm           (window_end - (t_now + slew)) / block_duration
   ephemeris_uncertainty_norm      σ_timing / period (fractional uncertainty)
   remaining_opps_mission_norm     remaining opportunities in mission / available_total
   remaining_opps_season_norm      remaining opportunities in next 90 days / 10
@@ -79,16 +97,23 @@ STATIC_FEATURE_NAMES: list[str] = [
 
 # Dynamic feature names (computed from MissionState each step)
 DYNAMIC_FEATURE_NAMES: list[str] = [
+    # Progress state
     "obs_completed_norm",
     "progress_in_tier",
     "current_tier_norm",
     "obs_remaining_norm",
+    # Immediate action-quality (same event that would execute if selected now)
+    "capture_fraction_now",
+    "block_currently_active",
+    "time_to_block_end_norm",
+    "idle_if_selected_norm",
+    "slew_norm",
+    "scheduling_slack_norm",
+    # Future opportunity features
     "dt_next_event_norm",
     "dt_second_event_norm",
     "dt_third_event_norm",
     "block_duration_norm",
-    "slew_norm",
-    "scheduling_slack_norm",
     "ephemeris_uncertainty_norm",
     "remaining_opps_mission_norm",
     "remaining_opps_season_norm",
@@ -111,11 +136,13 @@ _NORM = {
     "stellar_metallicity":       1.5,       # typical range ±1 dex → clip at ±3
     "distance_norm":             1000.0,
     "tier_goal_norm":            3.0,
+    "time_to_block_end_norm":    10.0,      # block_end within 10-day lookahead
+    "idle_if_selected_norm":     2.0 / 24,  # 2-hr idle cap in days
+    "slew_norm":                 2.0 / 24,  # 2-hr slew cap in days
     "dt_next_event_norm":        365.25,
     "dt_second_event_norm":      365.25,
     "dt_third_event_norm":       365.25,
     "block_duration_norm":       3.0,       # 2.5 × T14; max ≈ 2.5 d for long transits
-    "slew_norm":                 2.0 / 24,  # 2-hr slew cap in days
     "host_multiplicity_norm":    5.0,
     "remaining_opps_season_norm": 10.0,
 }
@@ -162,7 +189,7 @@ def build_static_features(state: "MissionState") -> np.ndarray:
         arr[i, 9] = 1.0 if "eclipse" in pref else (0.5 if "either" in pref else 0.0)
         arr[i, 10] = min(host_counts.get(hid, 1), 5) / _NORM["host_multiplicity_norm"]
 
-    # Clip stellarmetallicity to [-3, 3] range then normalise
+    # Clip stellar metallicity to [-3, 3] range then normalise
     arr[:, 5] = np.clip(arr[:, 5], -3.0, 3.0) / _NORM["stellar_metallicity"]
 
     return arr
@@ -171,6 +198,7 @@ def build_static_features(state: "MissionState") -> np.ndarray:
 def build_planet_features(
     state: "MissionState",
     static_features: np.ndarray | None = None,
+    per_target_events: dict[str, dict] | None = None,
 ) -> np.ndarray:
     """Compute the full per-planet feature matrix for the current step.
 
@@ -181,6 +209,14 @@ def build_planet_features(
     static_features:
         Pre-computed static features from ``build_static_features``.
         If None, they are computed on the fly (slightly slower).
+    per_target_events:
+        Mapping from ``target_id`` to the event dict that would be executed
+        if that planet were selected right now.  When provided, dynamic
+        timing features (capture_fraction, block_duration, slew, etc.) are
+        derived from these events — ensuring the planet token describes
+        exactly the same observation opportunity that the environment would
+        execute.  When omitted, timing is computed independently from
+        orbital parameters (fallback; used in unit tests).
 
     Returns
     -------
@@ -212,64 +248,104 @@ def build_planet_features(
 
         # ---- progress features ----
         t3_req = int(row.get("tier3_required_obs", 1)) or 1
-        obs_done = int(prog.get("obs_completed", 0))
+        obs_done = float(prog.get("obs_completed", 0.0))
         t_prog = float(prog.get("progress_in_tier", 0.0))
         t_tier = int(prog.get("current_tier", 0))
-        obs_rem = int(prog.get("obs_remaining_next_tier", t3_req))
+        obs_rem = float(prog.get("obs_remaining_next_tier", float(t3_req)))
 
         arr[i, n_static + 0] = obs_done / t3_req
         arr[i, n_static + 1] = t_prog
         arr[i, n_static + 2] = t_tier / 3.0
         arr[i, n_static + 3] = obs_rem / t3_req
 
-        # ---- next three upcoming events (Δt, block duration, slew, slack) ----
-        # Use DynamicBackend to find the next few events for this target.
-        # We ask the backend for up to 3 future events by computing mid-times
-        # directly from orbital parameters (avoids full candidates() call).
-        period = float(row.get("period", 1.0)) or 1.0
-        epoch  = float(row.get("epoch", t_now))
-        tr_dur_days = float(row.get("transit_duration", 0.0)) / 86400.0
-        block_dur = COST_FACTOR * tr_dur_days
+        # ---- immediate action-quality features ----
+        # Use the pre-computed event from _candidates_target when available
+        # so that the features describe exactly the event that would execute.
+        ev = per_target_events.get(tid) if per_target_events is not None else None
 
-        # Next three transit mid-times after t_now
-        phase = (t_now - epoch) % period
-        mid0 = t_now + (period - phase)          # first mid-time after t_now
-        # Exact mid-times
-        mids = [mid0, mid0 + period, mid0 + 2 * period]
-        dts  = [m - t_now for m in mids]
+        if ev is not None:
+            # Trusted path: event from the same backend call used for execution.
+            block_dur   = float(ev.get("block_duration_days", 0.0))
+            window_mid  = float(ev.get("window_mid", t_now))
+            block_start = window_mid - block_dur / 2.0
+            block_end   = window_mid + block_dur / 2.0
+            ev_ra       = float(row.get("ra", 0.0))
+            ev_dec      = float(row.get("dec", 0.0))
+        else:
+            # Fallback: compute from orbital parameters.
+            period      = float(row.get("period", 1.0)) or 1.0
+            epoch       = float(row.get("epoch", t_now))
+            tr_dur_days = float(row.get("transit_duration", 0.0)) / 86400.0
+            block_dur   = COST_FACTOR * tr_dur_days
+            phase       = (t_now - epoch) % period
+            half_block  = block_dur * COST_FACTOR / 2.0
+            in_block    = phase < (COST_FACTOR * tr_dur_days / 2.0)
+            if in_block:
+                window_mid = t_now - phase
+            else:
+                window_mid = t_now + (period - phase)
+            block_start = window_mid - block_dur / 2.0
+            block_end   = window_mid + block_dur / 2.0
+            ev_ra       = float(row.get("ra", 0.0))
+            ev_dec      = float(row.get("dec", 0.0))
 
-        arr[i, n_static + 4] = min(dts[0], 365.25) / _NORM["dt_next_event_norm"]
-        arr[i, n_static + 5] = min(dts[1], 365.25) / _NORM["dt_second_event_norm"]
-        arr[i, n_static + 6] = min(dts[2], 365.25) / _NORM["dt_third_event_norm"]
-        arr[i, n_static + 7] = min(block_dur, 3.0) / _NORM["block_duration_norm"]
-
-        # Slew from current pointing
         slew = slew_time_days(
             ra1=state.current_ra, dec1=state.current_dec,
-            ra2=float(row.get("ra", 0.0)), dec2=float(row.get("dec", 0.0)),
+            ra2=ev_ra, dec2=ev_dec,
         )
-        arr[i, n_static + 8] = slew / _NORM["slew_norm"]
+        t_arrive = t_now + slew
 
-        # Scheduling slack: how much margin before the first block starts
-        #   slack = (block_start of next event) - (t_now + slew)
-        #   block_start = mid0 - block_dur / 2
-        block_start0 = mids[0] - block_dur / 2.0
-        t_arrive0 = t_now + slew
-        slack = (block_start0 - t_arrive0) / max(block_dur, 1e-6)
+        # capture_fraction: mirrors execute_observation's three cases
+        if block_dur <= 0.0 or t_arrive >= block_end:
+            capture_fraction = 0.0
+        elif t_arrive <= block_start:
+            capture_fraction = 1.0
+        else:
+            capture_fraction = (block_end - t_arrive) / block_dur
+
+        block_active  = 1.0 if (t_now > block_start and t_now < block_end) else 0.0
+        time_to_bend  = max(0.0, block_end - t_now)
+        idle_now      = max(0.0, block_start - t_arrive)
+
+        # scheduling slack: how much margin before block_start if selected now
+        slack = (block_start - t_arrive) / max(block_dur, 1e-6)
+
+        arr[i, n_static + 4] = float(np.clip(capture_fraction, 0.0, 1.0))
+        arr[i, n_static + 5] = block_active
+        arr[i, n_static + 6] = time_to_bend  / _NORM["time_to_block_end_norm"]
+        arr[i, n_static + 7] = idle_now      / _NORM["idle_if_selected_norm"]
+        arr[i, n_static + 8] = slew          / _NORM["slew_norm"]
         arr[i, n_static + 9] = float(np.clip(slack, -1.0, 10.0)) / 10.0
+
+        # ---- future opportunity features ----
+        # Next three event mid-times computed from orbital parameters.
+        # (Always uses orbital params for the 2nd/3rd events regardless of backend.)
+        period  = float(row.get("period", 1.0)) or 1.0
+        epoch   = float(row.get("epoch", t_now))
+        phase   = (t_now - epoch) % period
+        mid0    = t_now + (period - phase)   # first mid after t_now (always future)
+        mids    = [mid0, mid0 + period, mid0 + 2 * period]
+        dts     = [m - t_now for m in mids]
+
+        arr[i, n_static + 10] = min(dts[0], 365.25) / _NORM["dt_next_event_norm"]
+        arr[i, n_static + 11] = min(dts[1], 365.25) / _NORM["dt_second_event_norm"]
+        arr[i, n_static + 12] = min(dts[2], 365.25) / _NORM["dt_third_event_norm"]
+
+        # block_duration from the backend event (or fallback)
+        arr[i, n_static + 13] = min(block_dur, 3.0) / _NORM["block_duration_norm"]
 
         # Ephemeris uncertainty (fractional: σ_timing / period)
         unc_days = float(row.get("epoch_uncertainty", 0.0)) or 0.0
-        arr[i, n_static + 10] = min(unc_days / period, 1.0)
+        arr[i, n_static + 14] = min(unc_days / period, 1.0)
 
         # Remaining opportunities in mission
         avail_total = float(row.get("available_transits", 0)) or 1.0
         remaining_mission = max(0.0, (mission_end - mid0) / period)
-        arr[i, n_static + 11] = min(remaining_mission / avail_total, 1.0)
+        arr[i, n_static + 15] = min(remaining_mission / avail_total, 1.0)
 
         # Remaining opportunities in next 90-day season
         remaining_season = max(0.0, (season_end - mid0) / period)
-        arr[i, n_static + 12] = min(remaining_season, 10.0) / _NORM["remaining_opps_season_norm"]
+        arr[i, n_static + 16] = min(remaining_season, 10.0) / _NORM["remaining_opps_season_norm"]
 
     # Global clip to reasonable range
     arr = np.clip(arr, -3.0, 3.0)

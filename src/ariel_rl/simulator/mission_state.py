@@ -73,6 +73,10 @@ class MissionState:
     current_ra: float = 0.0
     current_dec: float = 0.0
 
+    # Per-observation overhead (settle, guide-star acquisition, etc.).
+    # Wired from MissionConfig.overhead_days_per_obs; default 0.0.
+    overhead_days_per_obs: float = 0.0
+
     # Observation history for diagnostics / Gantt chart
     obs_log: list = field(default_factory=list, repr=False)
 
@@ -156,6 +160,7 @@ class MissionState:
         backend,
         mission_start: float = MISSION_START_BJD,
         mission_end: float = MISSION_END_BJD,
+        overhead_days_per_obs: float = 0.0,
     ) -> "MissionState":
         """Construct a fresh MissionState using a ``DynamicBackend``.
 
@@ -177,6 +182,7 @@ class MissionState:
             current_ra=ra0,
             current_dec=dec0,
             _backend=backend,
+            overhead_days_per_obs=overhead_days_per_obs,
         )
 
     # ------------------------------------------------------------------
@@ -287,11 +293,15 @@ class MissionState:
 
         if missed:
             self.clock.record_miss()
-            # Pay only the slew; no science, no idle wait.
+            # Pay the slew; no science, no idle wait.
             self.clock.advance(obs_duration_days=0.0, slew_days=slew_days)
             idle_days = 0.0
             obs_duration_days = 0.0
             effective_fraction = 0.0
+            # The telescope still slewed to this target — update pointing so
+            # future slew costs are calculated from the new position.
+            self.current_ra  = float(target["ra"])
+            self.current_dec = float(target["dec"])
         else:
             # ---- Idle: arrived before block_start → wait ----
             idle_days = max(0.0, block_start - t_arrive)
@@ -323,6 +333,7 @@ class MissionState:
                 obs_duration_days=obs_duration_days,
                 slew_days=slew_days,
                 idle_days=idle_days,
+                overhead_days=self.overhead_days_per_obs,
             )
             self.current_ra  = float(target["ra"])
             self.current_dec = float(target["dec"])

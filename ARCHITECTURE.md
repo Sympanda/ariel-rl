@@ -179,7 +179,7 @@ Generates the event stream and tracks evolving mission state.  **Completely inde
 | `event_generator.py` | `generate_events(targets)` — calls `propagate()` for every target, assembles the full event DataFrame sorted by `window_mid`.  `Preferred Method` column controls whether transits, eclipses, or both are generated. |
 | `event_backend.py` | **Pluggable event backend** — `EventBackend` ABC + two concrete implementations (`TableBackend`, `DynamicBackend`).  See below. |
 | `slew.py` | `slew_time_seconds(ra1, dec1, ra2, dec2)` — haversine great-circle distance × `rate_s_per_deg`, clamped to [min_slew, max_slew].  `build_slew_matrix(targets)` pre-computes an N×N lookup. |
-| `mission_clock.py` | `MissionClock` dataclass — tracks `current_time` (BJD), splits usage into science/slew/overhead, exposes `remaining_time`, `fraction_elapsed`, `can_fit()`. |
+| `mission_clock.py` | `MissionClock` dataclass — tracks `current_time` (BJD), splits usage into science/slew/overhead, exposes `remaining_time`, `fraction_elapsed` (= `elapsed / (mission_end − mission_start)`, correct for curriculum episodes), `can_fit()`. |
 | `mission_state.py` | `MissionState` — owns targets, events, clock, progress table, and current pointing.  `execute_observation(event_id)` is the core step function; delegates event lookup to the active backend. |
 
 ### Event backend abstraction
@@ -204,13 +204,18 @@ Computes observation windows on-the-fly from orbital parameters via **vectorised
 
 ```python
 # At each step, for all targets in parallel:
-phase      = (t_now − epoch) % period        # position in current cycle
-in_transit = phase < transit_dur / 2         # bool array (N,)
-t_center   = where(in_transit,
-                   t_now − phase,             # ongoing transit: centre in past
-                   t_now + (period − phase))  # next transit: centre in future
-window_end = t_center + transit_dur / 2
+cf          = COST_FACTOR                     # = 2.5
+half_block  = transit_dur / 2 * cf           # = 1.25 × T14  (block half-width)
+phase       = (t_now − epoch) % period        # position in current cycle
+in_block    = phase < half_block              # still inside observation block?
+t_center    = where(in_block,
+                    t_now − phase,            # current occurrence
+                    t_now + (period − phase)) # next occurrence
+block_end   = t_center + half_block
+valid       = block_end > t_now               # keep until block closes, not raw T14
 ```
+
+An event stays available until `block_end = window_mid + 1.25 × T14`, not the raw transit end (`window_mid + 0.5 × T14`).  This is correct because a late arrival can still capture a partial fraction of the block and contribute fractional progress.  `preferred_method` is respected: `"Transit"` targets produce only transit candidates; `"Eclipse"` targets produce only eclipse candidates; `"Either"` targets produce both.
 
 | Characteristic | Value |
 |---|---|
@@ -384,7 +389,7 @@ Wraps `MissionState` as a Gymnasium environment.  The sim and the env are **deli
 |---|---|---|
 | `topk` | `Discrete(K)` | Agent picks index 0…K-1 into the K upcoming events sorted by `window_mid`.  Default. |
 | `target` | `Discrete(N)` | Agent picks target index 0…N-1; env auto-schedules the next available event for that target |
-| `full_set` | `Discrete(N)` | Like `target` but the observation is a full per-planet feature matrix over all N targets rather than K events.  Intended for set-based transformer policies that can reason about the entire catalogue. |
+| `full_set` | `Discrete(N)` | Like `target` but the observation is a full per-planet feature matrix (`N × N_PLANET_FEATURES`) over all N targets rather than K events.  **Currently an observation-space scaffold**: the environment infrastructure is complete but a dedicated ISAB Set Transformer policy has not yet been implemented (see development roadmap).  The existing `ArielTransformerPolicy` can be used as a temporary full-attention baseline over N planet tokens. |
 
 Selected via `config.action.type`.  Invalid actions are penalised with `reward = -invalid_action_penalty` (default −0.5) and do not advance the clock.
 
@@ -406,9 +411,10 @@ valid iff:
 
 This allows the agent to see — and choose — observations where it arrives after the raw transit ends but before the observation block closes, yielding a partial capture rather than a hard miss.
 
-#### No-valid-action fallback (`_skip_to_next_feasible`)
+#### No-valid-action fallback
 
-When all K candidates fail the feasibility mask (e.g., current pointing is far from all upcoming transits), the env progressively looks at `2K, 3K, …` candidates rather than terminating immediately.  This prevents premature episode end when the agent is temporarily in a "bad" sky region.
+- **`topk` mode** (`_skip_to_next_feasible_topk`): when all K candidates fail the feasibility mask the env progressively looks at `2K, 3K, …` candidates rather than terminating immediately.  This prevents premature episode end when the agent is temporarily in a "bad" sky region.
+- **`target` / `full_set` modes**: candidates are exactly one per target (fixed set); if no target is feasible, the episode terminates.  There is no larger window to look at.
 
 ### Observation space
 
@@ -439,7 +445,7 @@ Each of the K candidate events contributes one row.  Slots beyond the number of 
 | 5 | `capture_fraction` | `(block_end − t_arrive) / block_dur` | already [0,1] | **New.** Fraction of block capturable if chosen now; 1.0 = full, <1 = late arrival |
 | 6 | `progress_in_tier` | progress table | already [0,1] | Fraction of equivalent obs completed toward the **next** tier boundary |
 | 7 | `obs_remaining_next_tier_norm` | `obs_remaining / tier3_required_obs` | per-target max | Equivalent obs still needed (float); comparable across targets |
-| 17 | `days_to_window_end_norm` | `window_end − t_now` | 2 days | Absolute urgency; small = act now |
+| 17 | `days_to_block_end_norm` | `block_end − t_now` | 5 days | Time until the observation block closes (scheduling deadline); small = act now |
 
 **Static features** (fixed per target across the mission):
 
@@ -455,7 +461,7 @@ Each of the K candidate events contributes one row.  Slots beyond the number of 
 | 15 | `tier_goal_norm` | `event.tier_goal / 3` | already [0,1] | Which tier this observation contributes toward |
 | 16 | `event_type_binary` | event table | — | 0 = transit, 1 = eclipse |
 
-> **Removed features** (vs original design): `wait_time_days` (83 % zeros — superseded by `window_urgency_norm`), `is_valid` (constant 1.0 after action-mask fix — replaced by `days_to_window_end_norm`).
+> **Removed features** (vs original design): `wait_time_days` (83 % zeros — superseded by `window_urgency_norm`), `is_valid` (constant 1.0 after action-mask fix — replaced by `days_to_block_end_norm`).
 >
 > **Added**: `capture_fraction` — tells the policy exactly how much science it would receive if it chose this event right now.  Combined with `total_time_cost_days`, the policy can compute the marginal value of a partial observation versus waiting for a cleaner window.
 
@@ -823,12 +829,12 @@ predict_values(obs) → values
 
 #### `ArielMlpPolicy` (`policies/mlp_scorer.py`)
 
-A simple sanity-check policy — flattens the `(K × 16)` event matrix and 25-d global vector, processes them through a shared MLP, and outputs independent logit and value heads.
+A simple sanity-check policy — flattens the `(K × 18)` event matrix and the global vector, processes them through a shared MLP, and outputs independent logit and value heads.
 
 ```
-obs["events"]  (K×16) ──┐
+obs["events"]  (K×18) ──┐
                          ├─ flatten → shared_mlp(256→256) → policy_head (K,) + value_head (1,)
-obs["global"]  (25,)  ──┘
+obs["global"]  (G,)   ──┘
 ```
 
 Action logits are clipped to `−∞` for masked positions before the softmax.
@@ -838,9 +844,9 @@ Action logits are clipped to `−∞` for masked positions before the softmax.
 The primary architecture.  Each of the K candidate events is treated as a token; a transformer encoder with multi-head self-attention processes the full set simultaneously, enabling the policy to reason about relative priorities across all candidates in a single pass.
 
 ```
-obs["events"]  (K×16) → event_proj(16→d_model)  ─┐
+obs["events"]  (K×18) → event_proj(18→d_model)  ─┐
                                                     ├─ [CLS | e_1 | … | e_K]
-obs["global"]  (25,)  → global_proj(25→d_model) ──┘  (prepend CLS from global embedding)
+obs["global"]  (G,)   → global_proj(G→d_model)  ──┘  (prepend CLS from global embedding)
                                                    │
                                               TransformerEncoder
                                               (n_layers=2, n_heads=4, d_model=128, Pre-LN)

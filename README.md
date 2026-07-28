@@ -118,7 +118,7 @@ The agent observation at each step is a dict of two arrays:
 
 *Static* (fixed per target): `base_science_value`, `science_weight`, `planet_radius`, `planet_temperature`, `planet_mass`, `stellar_temperature`, `stellar_metallicity`, `tier_goal`, `event_type`.
 
-*Dynamic* (update each step): `slew_time_days`, `window_urgency_norm`, `duration_days`, `block_duration_days` (= 2.5 × T₁₄), `total_time_cost_days` (slew + idle + block), `capture_fraction` (**new** — fraction of block still capturable if chosen now; 1 = full, <1 = partial late arrival), `progress_in_tier`, `obs_remaining_next_tier_norm`, `days_to_window_end_norm`.
+*Dynamic* (update each step): `slew_time_days`, `window_urgency_norm`, `duration_days`, `block_duration_days` (= 2.5 × T₁₄), `total_time_cost_days` (slew + idle + **effective_fraction** × block_dur; reduced when near a tier boundary), `capture_fraction` (fraction of block still capturable if chosen now; 1 = full, <1 = late arrival), `progress_in_tier`, `obs_remaining_next_tier_norm`, `days_to_block_end_norm` (time to scheduling deadline `block_end = mid + 1.25 × T₁₄`; replaces `days_to_window_end_norm`).
 
 **Global mission features** (`obs["global"]`, shape `G = 26`) — mission-level summary the same for all K candidates:
 
