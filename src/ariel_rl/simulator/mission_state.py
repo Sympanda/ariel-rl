@@ -221,7 +221,11 @@ class MissionState:
         -------
         dict with keys:
             target_id, event_type, block_duration_days, slew_days, idle_days,
-            obs_duration_days, total_cost_days, captured_fraction,
+            obs_duration_days, total_cost_days,
+            captured_fraction  — geometric: fraction of block offered by the window,
+            effective_fraction — actual: min(captured_fraction, obs_remaining_before),
+                                 capped at tier boundary so the agent regains control
+                                 as soon as the tier threshold is crossed,
             tier_before, tier_after, tier_completed,
             obs_number, missed (bool), progress_before, progress_after,
             science_weight, population_bin, period, host_id
@@ -278,6 +282,8 @@ class MissionState:
 
         tier_before    = int(self._progress_dict[target_id]["current_tier"])
         progress_before = float(self._progress_dict[target_id]["progress_in_tier"])
+        obs_remaining_before = float(self._progress_dict[target_id]["obs_remaining_next_tier"])
+        max_tier_val = int(target.get("max_tier", 3))
 
         if missed:
             self.clock.record_miss()
@@ -285,15 +291,33 @@ class MissionState:
             self.clock.advance(obs_duration_days=0.0, slew_days=slew_days)
             idle_days = 0.0
             obs_duration_days = 0.0
+            effective_fraction = 0.0
         else:
             # ---- Idle: arrived before block_start → wait ----
             idle_days = max(0.0, block_start - t_arrive)
 
-            # ---- Observation duration = captured portion of the block ----
-            # For a full capture (fraction=1.0) this equals block_duration_days.
-            # For a partial capture the clock advances by only the remaining
-            # portion, so telescope time is not "wasted" on the elapsed part.
-            obs_duration_days = captured_fraction * block_duration_days
+            # ---- Tier-scoped effective fraction ----
+            # An observation is committed to completing the *current* tier (or
+            # as much of it as the window allows).  Two constraints apply:
+            #
+            #   1. Window constraint: cannot observe beyond what the block offers
+            #      (captured_fraction, computed from arrival time).
+            #   2. Tier constraint: observation stops as soon as the tier threshold
+            #      is crossed — the agent regains control immediately and may choose
+            #      whether to invest more time in this target (next tier) or elsewhere.
+            #
+            # If the target is already at max_tier, no science is collected.
+            # The action mask prevents this in normal operation, but we enforce it
+            # here as a hard invariant so the RL policy can never "waste" an action
+            # observing a fully-completed target.
+            if tier_before >= max_tier_val:
+                effective_fraction = 0.0   # safety net — should be masked
+            elif obs_remaining_before <= 0.0:
+                effective_fraction = 0.0   # tier already hit exactly
+            else:
+                effective_fraction = min(captured_fraction, obs_remaining_before)
+
+            obs_duration_days = effective_fraction * block_duration_days
 
             self.clock.advance(
                 obs_duration_days=obs_duration_days,
@@ -302,7 +326,7 @@ class MissionState:
             )
             self.current_ra  = float(target["ra"])
             self.current_dec = float(target["dec"])
-            self._increment_progress(target_id, target, captured_fraction)
+            self._increment_progress(target_id, target, effective_fraction)
 
         tier_after    = int(self._progress_dict[target_id]["current_tier"])
         progress_after = float(self._progress_dict[target_id]["progress_in_tier"])
@@ -310,26 +334,27 @@ class MissionState:
         total_cost_days = slew_days + idle_days + obs_duration_days
 
         info = {
-            "target_id":           target_id,
-            "event_id":            event_id,
-            "event_type":          event["event_type"],
-            "block_duration_days": block_duration_days,
-            "obs_duration_days":   obs_duration_days,
-            "captured_fraction":   captured_fraction,
-            "slew_days":           slew_days,
-            "idle_days":           idle_days,
-            "total_cost_days":     total_cost_days,
-            "tier_before":         tier_before,
-            "tier_after":          tier_after,
-            "tier_completed":      tier_after > tier_before,
-            "obs_number":          float(self._progress_dict[target_id]["obs_completed"]),
-            "missed":              missed,
-            "progress_before":     progress_before,
-            "progress_after":      progress_after,
-            "science_weight":      float(target.get("science_weight", 0.5)),
-            "population_bin":      str(target.get("population_bin", "")),
-            "period":              float(target.get("period", 0.0)),
-            "host_id":             str(target.get("host_id", "")),
+            "target_id":            target_id,
+            "event_id":             event_id,
+            "event_type":           event["event_type"],
+            "block_duration_days":  block_duration_days,
+            "obs_duration_days":    obs_duration_days,
+            "captured_fraction":    captured_fraction,    # geometric: what the window offered
+            "effective_fraction":   effective_fraction,   # actual: capped at tier boundary
+            "slew_days":            slew_days,
+            "idle_days":            idle_days,
+            "total_cost_days":      total_cost_days,
+            "tier_before":          tier_before,
+            "tier_after":           tier_after,
+            "tier_completed":       tier_after > tier_before,
+            "obs_number":           float(self._progress_dict[target_id]["obs_completed"]),
+            "missed":               missed,
+            "progress_before":      progress_before,
+            "progress_after":       progress_after,
+            "science_weight":       float(target.get("science_weight", 0.5)),
+            "population_bin":       str(target.get("population_bin", "")),
+            "period":               float(target.get("period", 0.0)),
+            "host_id":              str(target.get("host_id", "")),
         }
 
         # Append to observation log (used for Gantt / diagnostic plots)
@@ -342,6 +367,7 @@ class MissionState:
             "block_duration_days": block_duration_days,
             "obs_duration_days":   obs_duration_days,
             "captured_fraction":   captured_fraction,
+            "effective_fraction":  effective_fraction,
             "slew_days":           slew_days,
             "idle_days":           idle_days,
             "tier_before":         tier_before,
@@ -479,7 +505,7 @@ class MissionState:
             return pd.DataFrame(columns=[
                 "step", "mission_day", "target_id", "event_type",
                 "window_mid", "block_duration_days", "obs_duration_days",
-                "captured_fraction", "slew_days", "idle_days",
+                "captured_fraction", "effective_fraction", "slew_days", "idle_days",
                 "tier_before", "tier_after", "missed",
                 "population_bin", "science_weight", "ra", "dec",
             ])

@@ -399,6 +399,82 @@ class TestFractionalProgressAccumulation:
 
 
 # ---------------------------------------------------------------------------
+# Tier-scoped observation (effective_fraction capped at tier boundary)
+# ---------------------------------------------------------------------------
+
+class TestTierScopedObservation:
+    """Observation duration is capped when it would cross a tier boundary early.
+
+    The agent regains control as soon as the tier threshold is crossed — it does
+    NOT continue observing for the remainder of the captured window.
+    """
+
+    def _make_near_complete_state(self, obs_completed_start: float):
+        """Return a state with obs_completed already at obs_completed_start.
+
+        Target has tier1_required_obs=2 so the tier completes at obs_completed=2.
+        """
+        targets = _single_target_df(ra=0.0)
+        window_mid = MISSION_START_BJD + 10.0
+        events = _make_event(window_mid)
+        dur_d = 7200.0 / 86400.0
+        block_dur = COST_FACTOR * dur_d
+
+        from ariel_rl.data.observation_requirements import compute_progress
+        state = MissionState.from_tables(targets, events)
+        state.current_ra = 0.0
+        state.current_dec = 0.0
+
+        # Manually advance obs_completed to the desired starting value
+        target_row = state.targets.loc[state.targets["target_id"] == "T_PARTIAL"].iloc[0]
+        new_prog = compute_progress(obs_completed_start, target_row)
+        state._progress_dict["T_PARTIAL"].update(new_prog)
+        for k, v in new_prog.items():
+            state.progress.at["T_PARTIAL", k] = v
+
+        # Place clock before block_start (full window capture)
+        state.clock.current_time = window_mid - block_dur / 2.0 - 0.01 - MIN_SLEW_DAYS
+        return state, 0, block_dur
+
+    def test_effective_fraction_capped_at_obs_remaining(self):
+        """If obs_remaining=0.3 and window offers 1.0, effective_fraction=0.3."""
+        state, eid, block_dur = self._make_near_complete_state(obs_completed_start=1.7)
+        # obs_remaining = 2.0 - 1.7 = 0.3
+        info = state.execute_observation(eid)
+        assert info["effective_fraction"] == pytest.approx(0.3, rel=1e-3)
+
+    def test_clock_advances_by_effective_fraction_only(self):
+        """Clock advances by effective_fraction * block_dur, not full block."""
+        state, eid, block_dur = self._make_near_complete_state(obs_completed_start=1.7)
+        # obs_remaining = 0.3; window offers 1.0 → effective = 0.3
+        state.execute_observation(eid)
+        assert state.clock.used_science_time == pytest.approx(0.3 * block_dur, rel=1e-3)
+
+    def test_tier_completes_exactly_at_threshold(self):
+        """After the capped observation, obs_completed should hit exactly 2.0."""
+        state, eid, _ = self._make_near_complete_state(obs_completed_start=1.7)
+        state.execute_observation(eid)
+        obs = float(state.progress.loc["T_PARTIAL", "obs_completed"])
+        assert obs == pytest.approx(2.0, rel=1e-6)
+        assert state.progress.loc["T_PARTIAL", "tier1_done"]
+
+    def test_geometric_captured_fraction_unchanged(self):
+        """captured_fraction (geometric) is 1.0 regardless of tier cap."""
+        state, eid, _ = self._make_near_complete_state(obs_completed_start=1.7)
+        info = state.execute_observation(eid)
+        assert info["captured_fraction"] == pytest.approx(1.0, rel=1e-5)
+
+    def test_max_tier_produces_zero_science(self):
+        """Observing a fully-completed target collects no science (safety net)."""
+        state, eid, block_dur = self._make_near_complete_state(obs_completed_start=8.0)
+        # tier3_required_obs=8 and max_tier=3, so this target is fully done
+        state.execute_observation(eid)
+        assert state.clock.used_science_time == pytest.approx(0.0, abs=1e-9)
+        obs = float(state.progress.loc["T_PARTIAL", "obs_completed"])
+        assert obs == pytest.approx(8.0, rel=1e-6)  # unchanged
+
+
+# ---------------------------------------------------------------------------
 # Action mask consistency with block_end
 # ---------------------------------------------------------------------------
 

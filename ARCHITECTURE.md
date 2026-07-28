@@ -310,22 +310,31 @@ The telescope slews **immediately** after the action is chosen, then idles if it
                                                              / block_duration_days
     Case C  (t_arrive ≥ block_end):     MISSED — pay slew only, no science, no idle
 
-5.  (Cases A + B only)
-      idle_days    = max(0, block_start − t_arrive)   # wait if arrived early
-      obs_duration = captured_fraction × block_duration_days
-      advance clock by (slew + idle + obs_duration + overhead)
+5.  (Cases A + B only — tier-scoped effective fraction)
+      idle_days         = max(0, block_start − t_arrive)
+      obs_remaining     = obs_remaining_next_tier   (float, from progress table)
+      effective_fraction = min(captured_fraction, obs_remaining)
+                         # cap at tier boundary — agent regains control as soon
+                         # as this tier's threshold is crossed, not at window end
+                         # if target is at max_tier: effective_fraction = 0
+      obs_duration       = effective_fraction × block_duration_days
+      advance clock by (slew + idle + obs_duration)
       update current pointing → (target.ra, target.dec)
-      obs_completed += captured_fraction   # fractional progress accumulates
+      obs_completed += effective_fraction
       update progress table via compute_progress()
 
 6.  Return info dict: {tier_before, tier_after, tier_completed, missed,
-                       captured_fraction, obs_duration_days, slew_days,
-                       idle_days, total_cost_days, …}
+                       captured_fraction,  ← geometric (what the window offered)
+                       effective_fraction, ← actual (capped at tier boundary)
+                       obs_duration_days, slew_days, idle_days, total_cost_days, …}
 ```
 
 **Key design points:**
-- `obs_completed` is a **float** — partial captures (e.g. 0.6 equivalent obs) accumulate until the integer tier threshold is crossed.
-- `idle_days` (initial wait before block_start) is reported separately so the reward can penalise it without penalising the unavoidable slew.
+- `obs_completed` is a **float** — partial and tier-capped fractions accumulate until an integer tier threshold is crossed.
+- An observation is **tier-scoped**: the clock stops advancing as soon as the current tier threshold is hit. The agent then gets control back and may choose to continue with this target (next tier) or switch to something else.
+- If a target has already reached `max_tier`, `effective_fraction = 0` and no science is collected. This is enforced in the simulator regardless of what the RL mask does.
+- `captured_fraction` and `effective_fraction` are both reported in the info dict so diagnostics can distinguish "window offered 1.0 but we only needed 0.3 to complete the tier" from "window only offered 0.3 due to late arrival".
+- `total_time_cost_days` in the observation uses `effective_fraction` (not `captured_fraction`) so the agent sees the actual expected cost, which drops as a tier nears completion.
 - The action mask uses `block_end` (not `window_end`) as the miss cutoff, consistent with this model.
 
 ### Target progress table (mutable per episode)
@@ -426,7 +435,7 @@ Each of the K candidate events contributes one row.  Slots beyond the number of 
 | 1 | `window_urgency_norm` | `(t_now − window_start) / window_duration` | already [0,1] | 0 = just opened, →1 = closing |
 | 2 | `duration_days` | `event.duration_days` | 1 day | Raw transit / eclipse duration T₁₄ |
 | 3 | `block_duration_days` | `COST_FACTOR × duration_days` | 1 day | Full observation block (2.5 × T₁₄) |
-| 4 | `total_time_cost_days` | `slew + idle + block_duration` | 3 days | True cost of selecting this event from current state |
+| 4 | `total_time_cost_days` | `slew + idle + effective_fraction × block_duration` | 3 days | True expected cost, reduced when tier is nearly complete (effective_fraction < 1) |
 | 5 | `capture_fraction` | `(block_end − t_arrive) / block_dur` | already [0,1] | **New.** Fraction of block capturable if chosen now; 1.0 = full, <1 = late arrival |
 | 6 | `progress_in_tier` | progress table | already [0,1] | Fraction of equivalent obs completed toward the **next** tier boundary |
 | 7 | `obs_remaining_next_tier_norm` | `obs_remaining / tier3_required_obs` | per-target max | Equivalent obs still needed (float); comparable across targets |

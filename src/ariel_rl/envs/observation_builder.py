@@ -136,7 +136,6 @@ def _build_event_row(
     block_start  = window_mid - block_dur / 2.0
     block_end    = window_mid + block_dur / 2.0
     idle_days    = max(0.0, block_start - t_arrive)
-    total_cost   = slew_days + idle_days + block_dur
 
     # Fraction of the observation block that would be captured if chosen now.
     # Mirrors the three cases in MissionState.execute_observation:
@@ -162,6 +161,16 @@ def _build_event_row(
     prog_row = state._progress_dict.get(target_id)
     progress_in_tier = float(prog_row["progress_in_tier"]) if prog_row is not None else 0.0
     obs_rem = float(prog_row["obs_remaining_next_tier"]) if prog_row is not None else 1.0
+
+    # Effective capture = what the agent would actually receive from this event,
+    # capped at the tier boundary (mirrors execute_observation's tier-scoped logic).
+    # When obs_rem is large (target far from tier completion), this equals capture_fraction.
+    # As the tier nears completion, effective_capture shrinks, reducing predicted cost.
+    effective_capture = min(capture_fraction, obs_rem) if obs_rem > 0.0 else 0.0
+
+    # Total time cost uses effective duration so the agent sees the real cost,
+    # not the maximum possible window cost.
+    total_cost   = slew_days + idle_days + effective_capture * block_dur
 
     # Normalize obs_remaining by the target's *own* tier-3 requirement so
     # "fraction of work left" is in [0, 1] independent of catalogue-wide scale.

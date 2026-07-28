@@ -174,7 +174,7 @@ Each of the K candidate events contributes one row.  Rows beyond the real event 
 | `window_urgency_norm` | already [0,1] | `(t_now − window_start) / window_duration`. 0 = just opened, →1 = closing. |
 | `duration_days` | ÷ 1 day | Raw transit/eclipse duration T₁₄. |
 | `block_duration_days` | ÷ 1 day | Full observation block = 2.5 × T₁₄; the authoritative clock advance per observation. |
-| `total_time_cost_days` | ÷ 3 days | `slew + idle + block_duration`. True cost from current state. |
+| `total_time_cost_days` | ÷ 3 days | `slew + idle + effective_fraction × block_duration`. Uses the tier-capped effective duration, so cost shrinks as a target nears tier completion. |
 | `capture_fraction` | already [0,1] | **Fraction of the observation block capturable if chosen now.** 1.0 = arrive before block_start (full), <1 = arrive mid-block (partial). |
 | `progress_in_tier` | already [0,1] | Equivalent obs fraction completed toward the **next** tier boundary (float). |
 | `obs_remaining_next_tier_norm` | ÷ per-target max | Equivalent obs still needed (float), normalised for cross-target comparability. |
