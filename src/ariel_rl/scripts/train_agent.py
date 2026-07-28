@@ -419,6 +419,23 @@ def main() -> None:
         print(f"Reward : --reward-config {args.reward_config} not found — ignored")
 
     cfg = _override_config(cfg, args)
+
+    # ---- validate policy ↔ action-type compatibility ----
+    _full_set_policies = {"full_set_isab", "full_set_attention"}
+    _topk_policies     = {"transformer", "mlp"}
+    if args.policy in _full_set_policies and cfg.action.type != "full_set":
+        raise ValueError(
+            f"--policy {args.policy!r} requires --action-type full_set, "
+            f"but got action.type={cfg.action.type!r}.  "
+            "Add --action-type full_set to your command."
+        )
+    if args.policy in _topk_policies and cfg.action.type == "full_set":
+        raise ValueError(
+            f"--policy {args.policy!r} is designed for the topk action space but "
+            f"action.type={cfg.action.type!r}.  "
+            "Use --policy full_set_isab or --policy full_set_attention for full_set mode."
+        )
+
     print(f"  action.type      = {cfg.action.type}")
     print(f"  lifetime_days    = {cfg.mission.lifetime_days}")
     print(f"  max_tier_cap     = {cfg.mission.max_tier_cap}")
