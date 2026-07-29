@@ -391,7 +391,7 @@ Wraps `MissionState` as a Gymnasium environment.  The sim and the env are **deli
 |---|---|---|
 | `topk` | `Discrete(K)` | Agent picks index 0…K-1 into the K upcoming events sorted by `window_mid`.  Default. |
 | `target` | `Discrete(N)` | Agent picks target index 0…N-1; env auto-schedules the next available event for that target |
-| `full_set` | `Discrete(N_max)` | **Dynamic active planet set.** Only genuinely active targets (those with `current_tier < max_tier`) participate in ISAB/PMA attention as real tokens.  Completed targets are removed from the set after each observation.  `N_max` is a hard ceiling set via `action.full_set.n_max` (default = `len(targets)`; recommended 2000 for the full Ariel catalogue).  A `ValueError` is raised at initialisation if `len(catalogue) > N_max`.  Rows beyond `n_active` are zero-padded sentinels (always masked False).  The mapping `action_index i → _active_target_ids[i]` is maintained explicitly and rebuilt after each removal.  Each active-planet token is associated with its **first reachable upcoming event** — the first event whose block has not yet expired given the telescope's current slew time.  Possible-but-expensive choices remain valid actions; only genuinely impossible or completed targets are removed/masked.  Three policy architectures are available: **FullSetISABPolicy** (ISAB, O(N·m)), **FullSetSelfAttentionPolicy** (full O(N²) ablation), and the pre-existing **ArielTransformerPolicy** (Top-K, unchanged). |
+| `full_set` | `Discrete(N_max)` | **Dynamic active planet set.** Only genuinely active targets (those with `current_tier < max_tier`) participate in ISAB/PMA attention as real tokens.  Completed targets are removed from the set after each observation.  `N_max` is the **fixed action/tensor size** and a hard ceiling set via `action.full_set.n_max` (default = `len(targets)`; recommended ≤ 2000 for the full Ariel catalogue).  A `ValueError` is raised at initialisation if `len(catalogue) > N_max`.  Rows beyond `n_active` are zero-padded sentinels (always masked False).  The mapping `action_index i → _active_target_ids[i]` is maintained explicitly and rebuilt after each removal.  Each active-planet token is associated with its **first reachable upcoming event** — the first event whose block has not yet expired given the telescope's current slew time.  Possible-but-expensive choices remain valid actions; only genuinely impossible or completed targets are removed/masked.  **Runtime insertion of genuinely new targets is deferred** — adding a target mid-episode would require simultaneous updates to the catalogue, MissionState, backend ephemeris, static feature cache, and active mapping; leave as future work for missions with dynamic discovery.  Three policy architectures are available: **FullSetISABPolicy** (ISAB, O(N·m)), **FullSetSelfAttentionPolicy** (full O(N²) ablation), and the pre-existing **ArielTransformerPolicy** (Top-K, unchanged). |
 
 Selected via `config.action.type`.  Invalid actions are penalised with `reward = -invalid_action_penalty` (default −0.5) and do not advance the clock.
 
@@ -402,16 +402,20 @@ The mask uses `block_end = window_mid + block_duration_days / 2` (not `window_en
 ```
 block_end = window_mid + block_duration_days / 2   # = window_mid + 1.25 × T14
 
-valid iff:
+valid iff (ALL modes, including full_set):
   1. visibility_valid == True
   2. block_end > t_now          (block not fully elapsed)
   3. t_arrive < block_end       (telescope arrives before block ends → capture_fraction > 0)
-  4. can_fit(slew + idle + block_duration)   (topk / target modes)
-     -- omitted for full_set (permissive): agent decides if partial capture is worth it
+  4. can_fit(slew + idle + captured_duration + overhead)   — tier-capped:
+       captured_duration = min(capture_fraction, obs_remaining_next_tier) × block_duration
+       actions requiring long idle waits are still allowed; only observations whose
+       actual time cost exceeds mission_end are rejected
   5. current_tier < max_tier    (not yet fully complete)
 ```
 
 This allows the agent to see — and choose — observations where it arrives after the raw transit ends but before the observation block closes, yielding a partial capture rather than a hard miss.
+
+`can_fit` uses the **tier-capped** captured duration rather than the full block duration.  When a target needs only 30 % of an observation to reach the next tier, the actual time cost is 30 % × block_duration, not the full 2.5 × T₁₄.  This makes near-completion observations cheaper in the feasibility check, consistent with how `execute_observation` stops the clock when the tier finishes early.
 
 #### No-valid-action fallback
 
@@ -859,10 +863,11 @@ The `ArielTransformerPolicy` remains the Top-K baseline — it is not replaced.
 **Core invariants for full_set policies:**
 1. One token = one active planet (completed planets are removed, not merely masked).
 2. An action means "slew towards this planet now."
-3. Each token's associated event is the **first reachable** opportunity (not just the nearest chronological one).
-4. Possible-but-poor choices remain as valid actions — discouraged by learned value/reward, not unnecessary masking.
+3. Each token's associated event is the **first reachable** opportunity — the first event whose block does not expire before the telescope arrives.  All per-planet features (immediate + future) are anchored to this event; `event_2`, `event_3` are the subsequent occurrences after it.
+4. Possible-but-poor choices remain as valid actions — discouraged by learned value/reward, not unnecessary masking.  Only physically infeasible actions (observation would exceed `mission_end`) are masked.
 5. Padding tokens (indices `n_active … N_max-1`) are always zero-vectors and always masked False.
 6. Global mission state conditions **both actor and critic** in all full_set policies.
+7. Runtime insertion of new targets mid-episode is **not yet supported** (deferred future work).  The dynamic set covers only removal of targets from the fixed initial catalogue.
 
 #### `ArielTransformerPolicy` (`policies/event_attention_policy.py`)
 
@@ -944,12 +949,24 @@ class RLAgentWrapper(BaselineAgent):
 ### Training script (`scripts/train_agent.py`)
 
 ```bash
+# Top-K Transformer (default)
 python src/ariel_rl/scripts/train_agent.py \
-    --policy transformer \   # or mlp
-    --timesteps 500000 \
+    --policy transformer \
+    --action-type topk \
+    --total-timesteps 500_000 \
     --n-envs 4 \
-    --run-name my_run \
-    --device auto            # auto-selects MPS / CUDA / CPU
+    --run-name topk_run \
+    --device auto
+
+# Full-Set ISAB (2000 planet tokens, ISAB attention)
+python src/ariel_rl/scripts/train_agent.py \
+    --policy full_set_isab \
+    --action-type full_set \
+    --n-max 2000 \
+    --total-timesteps 500_000 \
+    --n-envs 4 \
+    --run-name isab_run \
+    --device auto
 ```
 
 **Outputs** written to `outputs/<run_name>/`:
@@ -957,7 +974,8 @@ python src/ariel_rl/scripts/train_agent.py \
 | File | Contents |
 |---|---|
 | `model.zip` | Trained `MaskablePPO` model (SB3 format) |
-| `training_log.csv` | Per-rollout: timestep, episode reward/length, value loss, policy loss, entropy, KL |
+| `progress.csv` | Per-rollout: timestep, episode reward/length, value loss, policy loss, entropy, KL |
+| `reward_config.yaml` | Snapshot of the reward config used for this run |
 | `plots/training_curves.png` | Training loss + reward curves |
 | `plots/activity_<name>.png` | Monthly schedule breakdown (science / slew / idle) |
 | `plots/timeline_<name>.png` | Per-target Gantt chart |
@@ -973,7 +991,7 @@ CUDA                  →  torch.device("cuda")
 CPU  (fallback)       →  torch.device("cpu")
 ```
 
-**`TrainingLoggerCallback`** captures rollout metrics from SB3's `logger` at each `on_rollout_end` call and writes them to `training_log.csv` for offline analysis.
+**`TrainingLoggerCallback`** captures rollout metrics from SB3's `logger` at each `on_rollout_end` call and writes them to `progress.csv` for offline analysis.
 
 ### Comparing a trained RL model against baselines
 
@@ -1175,7 +1193,7 @@ scripts/                            ← top-level runnable scripts
 outputs/                            ← created by train_agent.py
 └── <run_name>/
     ├── model.zip                   ← saved MaskablePPO weights
-    ├── training_log.csv            ← per-rollout training metrics
+    ├── progress.csv                ← per-rollout training metrics
     └── plots/                      ← post-training diagnostic plots
 
 tests/

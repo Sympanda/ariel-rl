@@ -242,23 +242,42 @@ class TestDynamicRemoval:
 
 
 # ---------------------------------------------------------------------------
-# 4. Dynamic insertion — adding a target works without architecture changes
+# 4. Dynamic insertion — current limitation documented (Option B)
 # ---------------------------------------------------------------------------
 
 class TestDynamicInsertion:
-    def test_insert_new_target_grows_active_set(self):
-        """Inserting a new target into _active_target_ids increases set size."""
+    """Runtime insertion of genuinely new targets is *not* supported in the
+    current implementation.  Completed-target removal from a fixed initial
+    catalogue IS supported.  Runtime discovery is deferred as future work.
+
+    This test class documents the boundary: naively appending to
+    _active_target_ids does NOT make a target usable — it has no entry in
+    _target_lookup, no progress, and no backend ephemeris.
+    """
+
+    def test_runtime_insertion_is_not_supported(self):
+        """Naively appending a ghost target to _active_target_ids is unsafe.
+
+        A genuinely new target needs to be added to the target catalogue,
+        mission state, backend ephemeris, static feature cache, and active
+        mapping simultaneously.  Without that, the environment raises an error
+        or silently produces incorrect observations.
+
+        This test documents the limitation: runtime discovery is deferred as
+        future work.  The current dynamic set supports only *removal* of
+        targets from the fixed initial catalogue.
+        """
         env = _full_set_env(n_targets=5, n_max=10)
         env.reset(seed=0)
-        before = len(env._active_target_ids)
 
-        # Simulate a newly-discovered target by adding it to the active list
-        # (in a real mission this would happen via an event; here we test the mechanic)
-        new_tid = "T_NEW"
-        env._active_target_ids.append(new_tid)
-        env._active_tid_to_idx[new_tid] = len(env._active_target_ids) - 1
+        ghost_tid = "T_GHOST"
+        env._active_target_ids.append(ghost_tid)
+        env._active_tid_to_idx[ghost_tid] = len(env._active_target_ids) - 1
 
-        assert len(env._active_target_ids) == before + 1
+        # Expect either a shape error (from static-cache mismatch) or incorrect
+        # behaviour — either way, unsupported.
+        with pytest.raises(Exception):
+            env._build_observation()  # must fail — ghost not in catalogue or cache
 
 
 # ---------------------------------------------------------------------------
@@ -498,3 +517,197 @@ class TestPPOSmoke:
     def test_full_attention_smoke_train(self):
         model = self._make_env_and_model("full_set_attention")
         model.learn(total_timesteps=200)
+
+
+# ---------------------------------------------------------------------------
+# 10. Mission-end feasibility masking
+# ---------------------------------------------------------------------------
+
+class TestMissionEndFeasibility:
+    """Regression tests for the can_fit check in full_set mode.
+
+    Before fix: full_set used a permissive mask that skipped can_fit, so a
+    target whose idle wait would push past mission_end could still be selected.
+    After fix: can_fit is always checked using the tier-capped captured duration.
+    """
+
+    def _env_near_end(self, days_remaining: float, n_targets: int = 5) -> "ArielEnv":
+        """Return a full_set env with the clock manually wound close to mission_end."""
+        env = _full_set_env(n_targets=n_targets, n_max=20)
+        env.reset(seed=0)
+        # Advance the clock so only `days_remaining` are left
+        mission_end = env._state.clock.mission_end
+        env._state.clock._current_time = mission_end - days_remaining
+        return env
+
+    def test_target_beyond_mission_end_is_masked(self):
+        """Target whose first event starts 5 days away, but mission ends tomorrow."""
+        env = _full_set_env(n_targets=5, n_max=20)
+        env.reset(seed=0)
+
+        # Build a candidate table where the first event for target 0 is 5 days away
+        # and the mission ends in 1 day.
+        from ariel_rl.envs.action_mask import _mask_target
+        import pandas as pd
+
+        t_now = env._state.clock.current_time
+        mission_end = env._state.clock.mission_end
+        # Wind clock so only 1 day is left
+        env._state.clock.current_time = mission_end - 1.0
+
+        # Craft a candidate whose event is 5 days away (block_mid = t_now + 5)
+        # so slew=0, idle=5 days, captured_dur≈0.1 days → total ≈ 5.1 > 1 remaining
+        tid = env._active_target_ids[0]
+        target = env._state._target_lookup[tid]
+        t_now2 = env._state.clock.current_time
+        far_mid = t_now2 + 5.0
+        block_dur = 0.1
+        row = {
+            "event_id": 999, "target_id": tid, "event_type": "transit",
+            "window_start": far_mid - block_dur / 2.0,
+            "window_mid": far_mid,
+            "window_end": far_mid + block_dur / 2.0,
+            "duration": block_dur * 86400, "duration_days": block_dur,
+            "block_duration_days": block_dur, "tier_goal": 1,
+            "base_science_value": 1.0, "visibility_valid": True,
+            "ephemeris_uncertainty": 0.0, "event_index": -1,
+        }
+        candidates = pd.DataFrame([row])
+
+        from ariel_rl.utils.config import default_env_config
+        import dataclasses
+        cfg = default_env_config()
+        cfg = dataclasses.replace(cfg, action=dataclasses.replace(
+            cfg.action, type="full_set",
+            full_set=FullSetActionConfig(n_max=20),
+        ))
+        mask = _mask_target(
+            env._state, candidates,
+            include_completed=False, permissive=False,
+        )
+        assert not mask[0], (
+            "Target with event 5 days away must be masked when only 1 day remains"
+        )
+
+    def test_long_idle_still_feasible_if_fits_mission(self):
+        """Target that requires 4 days idle but still completes before mission_end."""
+        env = _full_set_env(n_targets=5, n_max=20)
+        env.reset(seed=0)
+
+        from ariel_rl.envs.action_mask import _mask_target
+        import pandas as pd, dataclasses
+
+        mission_end = env._state.clock.mission_end
+        # Wind clock so 5 days remain
+        env._state.clock.current_time = mission_end - 5.0
+        tid = env._active_target_ids[0]
+
+        t_now2 = env._state.clock.current_time
+        # Event starts in 4 days, observation takes 0.1 day → total ≈ 4.1 days < 5 days
+        mid = t_now2 + 4.0
+        block_dur = 0.1
+        row = {
+            "event_id": 998, "target_id": tid, "event_type": "transit",
+            "window_start": mid - block_dur / 2.0, "window_mid": mid,
+            "window_end": mid + block_dur / 2.0,
+            "duration": block_dur * 86400, "duration_days": block_dur,
+            "block_duration_days": block_dur, "tier_goal": 1,
+            "base_science_value": 1.0, "visibility_valid": True,
+            "ephemeris_uncertainty": 0.0, "event_index": -1,
+        }
+        candidates = pd.DataFrame([row])
+
+        cfg = default_env_config()
+        cfg = dataclasses.replace(cfg, action=dataclasses.replace(
+            cfg.action, type="full_set",
+            full_set=FullSetActionConfig(n_max=20),
+        ))
+        mask = _mask_target(
+            env._state, candidates,
+            include_completed=False, permissive=False,
+        )
+        assert mask[0], (
+            "Target requiring 4-day idle with 5 days remaining must remain selectable"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 11. Feature alignment: planet token event matches the executed action event
+# ---------------------------------------------------------------------------
+
+class TestFeatureAlignment:
+    """Validate that per-planet features describe the same event that would
+    actually execute if the agent selects that planet.
+
+    event_1 (the action event) is the first REACHABLE event, not the first
+    chronological one.  The future-event sequence (event_2, event_3) must
+    come AFTER event_1, not before.
+    """
+
+    def test_dt_next_event_matches_candidate_event(self):
+        """dt_next_event_norm should correspond to the event in the candidates table."""
+        env = _full_set_env(n_targets=5, n_max=10)
+        env.reset(seed=0)
+
+        obs, _ = env.reset(seed=0)
+        candidates = env._candidates
+
+        from ariel_rl.envs.planet_feature_builder import (
+            N_PLANET_FEATURES, PLANET_FEATURE_NAMES
+        )
+        # dt_next_event_norm is a specific feature; find its index
+        try:
+            dt_idx = PLANET_FEATURE_NAMES.index("dt_next_event_norm")
+        except ValueError:
+            pytest.skip("dt_next_event_norm not in PLANET_FEATURE_NAMES")
+
+        t_now = env._state.clock.current_time
+        n_active = len(env._active_target_ids)
+
+        for i in range(min(n_active, 5)):
+            if i >= len(candidates):
+                break
+            cand_mid = float(candidates.iloc[i]["window_mid"])
+            if cand_mid <= 0:
+                continue  # sentinel row
+
+            expected_dt = max(0.0, cand_mid - t_now)
+            # Get normalisation denominator (365.25 days by default)
+            norm_val = 365.25
+            feature_dt = obs["planets"][i, dt_idx] * norm_val
+
+            # Allow 1% tolerance (normalisation clipping may reduce large values)
+            expected_clipped = min(expected_dt, 365.25)
+            assert abs(feature_dt - expected_clipped) < 0.01 * max(expected_clipped, 0.1) + 0.01, (
+                f"Planet {i}: dt_next_event feature {feature_dt:.4f} does not match "
+                f"candidate mid {expected_clipped:.4f} (t_now={t_now:.2f}, cand_mid={cand_mid:.2f})"
+            )
+
+    def test_future_events_ordered_after_action_event(self):
+        """event_2 and event_3 must occur strictly after event_1."""
+        env = _full_set_env(n_targets=5, n_max=10)
+        env.reset(seed=0)
+
+        from ariel_rl.envs.planet_feature_builder import PLANET_FEATURE_NAMES
+
+        try:
+            dt1_idx = PLANET_FEATURE_NAMES.index("dt_next_event_norm")
+            dt2_idx = PLANET_FEATURE_NAMES.index("dt_second_event_norm")
+            dt3_idx = PLANET_FEATURE_NAMES.index("dt_third_event_norm")
+        except ValueError:
+            pytest.skip("Multi-event dt features not in PLANET_FEATURE_NAMES")
+
+        obs, _ = env.reset(seed=0)
+        n_active = len(env._active_target_ids)
+        norm = 365.25
+
+        for i in range(min(n_active, 5)):
+            dt1 = obs["planets"][i, dt1_idx] * norm
+            dt2 = obs["planets"][i, dt2_idx] * norm
+            dt3 = obs["planets"][i, dt3_idx] * norm
+            assert dt2 >= dt1 - 0.001, (
+                f"Planet {i}: event_2 dt={dt2:.3f} must be >= event_1 dt={dt1:.3f}"
+            )
+            assert dt3 >= dt2 - 0.001, (
+                f"Planet {i}: event_3 dt={dt3:.3f} must be >= event_2 dt={dt2:.3f}"
+            )

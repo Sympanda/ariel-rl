@@ -339,11 +339,18 @@ def build_planet_features(
         arr[i, n_static + 9] = float(np.clip(slack, -1.0, 10.0)) / 10.0
 
         # ---- future opportunity features (via backend — single source of truth) ----
-        # Ask the backend for the next 3 events for this target so that
-        # eclipse-only / either-type targets return the correct event type.
-        # Falls back to orbital-parameter reconstruction when no backend available.
+        # The future-event sequence MUST be anchored to the same event that
+        # would execute if the agent selects this planet.  When per_target_events
+        # provides the first-reachable event (ev), we start the lookahead from
+        # that event's window_mid so that:
+        #   future_events[0] = ev  (= event_1, the action event)
+        #   future_events[1] = next occurrence after ev  (= event_2)
+        #   future_events[2] = two occurrences after ev  (= event_3)
+        # Without this anchor, an unreachable earlier event could contaminate
+        # dt_next_event and make the immediate features describe different events.
         period = float(row.get("period", 1.0)) or 1.0
-        future_events = state._backend.events_for_target(tid, t_now, n=3)
+        future_anchor = float(ev["window_mid"]) if ev is not None else t_now
+        future_events = state._backend.events_for_target(tid, future_anchor, n=3)
 
         # dt features: use backend events when available
         for k_ev, slot in enumerate([10, 11, 12]):

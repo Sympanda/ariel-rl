@@ -318,12 +318,13 @@ The transformer treats each of the K candidate events as a token and uses self-a
 
 * **FullSetISABPolicy** implemented — ISAB × 2 + PMA critic, O(N·m) attention scalable to ~2000 planets.
 * **FullSetSelfAttentionPolicy** implemented — full O(N²) attention ablation for direct comparison.
-* **Dynamic active planet set**: completed planets are removed from the token set after each observation; only `n_active ≤ N_max` tokens participate in ISAB/PMA.  Explicit `action_index → target_id` mapping maintained.
-* **N_max is a hard ceiling**: `n_actions = n_max` exactly (not `max(len(catalogue), n_max)`).  `ValueError` raised at init if catalogue exceeds N_max.
-* **First-reachable-event semantics**: each active-planet token is associated with its first upcoming event that the telescope can reach given the current slew time — not blindly the first chronological event.  Possible-but-expensive choices are valid actions discouraged by value/reward, not masked.
+* **Dynamic active planet set**: completed planets are removed from the token set after each observation; only `n_active ≤ N_max` tokens participate in ISAB/PMA.  Explicit `action_index → target_id` mapping maintained.  Runtime insertion of genuinely new targets is deferred (future work for missions with dynamic discovery).
+* **N_max is a hard ceiling / fixed tensor size**: `n_actions = n_max` exactly.  `ValueError` raised at init if catalogue exceeds N_max.
+* **First-reachable-event semantics**: each active-planet token is associated with its first upcoming event reachable from the current telescope position.  All per-planet features (immediate + future lookahead) are anchored to this event so the token never describes two different events.
+* **Mission-end feasibility for all modes**: `can_fit(slew + idle + captured_duration + overhead)` is now checked for `full_set` as well — using the tier-capped captured duration so near-completion observations are not over-penalised.  Long-idle actions remain valid; only physically impossible ones (past `mission_end`) are rejected.
 * **Global conditioning in both actor and critic**: actor logits = `MLP(cat[token, global_embedding])`, meaning mission-wide state (elapsed time, coverage, accumulated science) directly conditions action selection.
-* `events_for_target()` and `register_event()` added to `DynamicBackend` — single source of truth for event timing, including long-period fallback registration.
-* All three policies wired into `train_agent.py`:
+* `events_for_target()` and `register_event()` added to `DynamicBackend` — single source of truth for event timing.
+* All three policies wired into `train_agent.py` with incompatibility rejection:
   `--policy transformer` (Top-K), `--policy full_set_isab`, `--policy full_set_attention`.
 
 Three-way comparison:

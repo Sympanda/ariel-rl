@@ -198,11 +198,20 @@ target nodes (features per target)
        └─ One token = one ACTIVE planet (current_tier < max_tier)
        └─ Completed planets are removed from the set after each step
        └─ Explicit action_index → target_id mapping rebuilt after each removal
-       └─ N_max is a hard ceiling: n_actions = n_max exactly
+       └─ N_max = fixed tensor/action size (hard ceiling on initial catalogue)
           (ValueError raised at init if len(catalogue) > n_max)
+       └─ Runtime insertion of new targets is DEFERRED — updating catalogue,
+          MissionState, backend, cache, and mapping simultaneously is non-trivial;
+          the dynamic set currently supports removal only
        └─ Each token represents the first REACHABLE upcoming event (not first chronological)
           — pools 20× the active-set size; falls back to events_for_target() + register_event()
             for long-period targets not in the pool
+       └─ All per-planet features anchored to the selected first-reachable event:
+          event_2 / event_3 are the next occurrences AFTER event_1, ensuring the
+          token never describes two different events simultaneously
+       └─ can_fit check applied in ALL modes (topk, target, full_set):
+          uses tier-capped captured_duration = min(cap_frac, obs_remaining) × block_dur
+          long-idle actions remain valid; only mission_end violations are rejected
        └─ Global mission features condition both actor AND critic
           (actor: cat([token, global_embed]) → MLP → logit)
        Policies:
@@ -213,6 +222,11 @@ target nodes (features per target)
        └─ shapes, N_max enforcement, dynamic removal, target mapping
        └─ permutation equivariance, padding invariance, global conditioning
        └─ PPO smoke tests for both policies
+       └─ mission-end masking (target 5d away masked at 1d remaining;
+          target 4d idle valid at 5d remaining)
+       └─ feature alignment (dt_next_event matches candidate event;
+          event_2/event_3 ordered after event_1)
+       └─ insertion limitation documented (runtime discovery raises, not silently corrupt)
 
 Three-way comparison now possible:
     Top-K full attention      (--policy transformer        --action-type topk)

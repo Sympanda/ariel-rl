@@ -6,13 +6,17 @@ A valid action is one where:
   2. The observation block hasn't already fully elapsed (block_end > t_now)
   3. The telescope can arrive before the block ends (t_arrive < block_end)
      giving a non-zero captured_fraction
-  4. The total cost fits in remaining mission time (topk / target modes)
+  4. The actual time cost (slew + idle + captured_duration + overhead) fits
+     in the remaining mission time — captured_duration uses the tier-capped
+     effective fraction, so a near-completion observation is cheaper than a
+     full block
   5. (optional) The target hasn't already reached max_tier
 
-For ``full_set`` mode the check is more permissive: only conditions 3 and 5
-are enforced.  The intent is to let the agent decide whether a small partial
-capture is worth the slew; the environment always returns a non-negative reward
-for any non-zero capture.
+Condition 4 applies to ALL action modes (topk, target, full_set).  In
+``full_set`` mode we still allow observations that require long idle waits,
+but we always reject observations whose actual time cost would push past
+mission_end.  Possible-but-inefficient choices are left available for the
+agent to weigh via learned value/reward.
 
 Returns a boolean numpy array of shape (n_candidates,).
 True = agent may choose this action.
@@ -62,7 +66,10 @@ def compute_mask(
         return _mask_target(
             state, candidate_events,
             include_completed=cfg.full_set.include_completed,
-            permissive=True,   # relax can_fit check; let agent weigh partial captures
+            # permissive=False: can_fit is always checked even for full_set.
+            # Long-idle actions are still allowed — the check only rejects
+            # observations whose total cost physically exceeds mission_end.
+            permissive=False,
         )
     else:
         raise ValueError(f"Unknown action space type: {cfg.type!r}")
@@ -165,74 +172,102 @@ def _mask_target(
     include_completed:
         If False, targets already at max_tier are masked out.
     permissive:
-        Used by ``full_set`` mode.  When True, the ``can_fit`` (budget) check
-        is omitted — only the block_end feasibility constraint is kept.  This
-        lets the agent see partial-capture opportunities even when the total
-        idle+block cost would exceed the remaining budget, since the actual
-        captured duration may be much shorter.
+        Retained for call-site compatibility; the can_fit check is now always
+        applied (using tier-capped captured duration) for all modes.  Actions
+        that require long idle waits are still allowed — only observations
+        whose actual time cost physically exceeds mission_end are rejected.
     """
-    from ariel_rl.simulator.slew import slew_time_days
+    from ariel_rl.simulator.slew import slew_time_days_vec
     from ariel_rl.data.schemas import COST_FACTOR
 
     n = len(next_events)
-    mask = np.zeros(n, dtype=bool)
-    t_now = state.clock.current_time
-    overhead = getattr(state, "overhead_days_per_obs", 0.0)
+    if n == 0:
+        return np.zeros(0, dtype=bool)
 
-    for i, (_, ev) in enumerate(next_events.iterrows()):
-        target_id = ev.get("target_id")
-        if target_id is None:
-            continue
+    t_now     = state.clock.current_time
+    remaining = state.clock.remaining_time
+    overhead  = getattr(state, "overhead_days_per_obs", 0.0)
 
-        # Completed targets
-        if not include_completed:
-            prog = state._progress_dict.get(target_id)
-            if prog is not None:
-                target_row = state._target_lookup.get(target_id)
-                if target_row is not None:
-                    if int(prog["current_tier"]) >= int(target_row["max_tier"]):
-                        continue
+    # ------------------------------------------------------------------
+    # Extract all columns as numpy arrays once (avoids per-row Series creation
+    # from iterrows(), which costs ~20 ms on 814-row DataFrames).
+    # ------------------------------------------------------------------
+    tids      = next_events["target_id"].to_numpy()        # object array of str
+    vis_valid = next_events["visibility_valid"].to_numpy(dtype=bool)
+    wmid      = next_events["window_mid"].to_numpy(dtype=float)
+    raw_dur   = next_events["duration_days"].to_numpy(dtype=float)
+    block_dur = next_events["block_duration_days"].to_numpy(dtype=float)
+    # Fall back to COST_FACTOR × duration_days for rows with no block_duration
+    zero_bd   = block_dur <= 0.0
+    block_dur = np.where(zero_bd, COST_FACTOR * raw_dur, block_dur)
 
-        # No event available (sentinel row)
-        if not bool(ev.get("visibility_valid", False)):
-            continue
+    block_end   = wmid + block_dur / 2.0
+    block_start = wmid - block_dur / 2.0
 
-        raw_dur   = float(ev.get("duration_days", 0.0))
-        block_dur = float(ev.get("block_duration_days", COST_FACTOR * raw_dur))
-        wmid      = float(ev.get("window_mid", t_now))
-        block_end = wmid + block_dur / 2.0
+    # ------------------------------------------------------------------
+    # Progress / tier lookups (still needs Python dict access per row, but
+    # a plain comprehension over object arrays is faster than iterrows()).
+    # Use explicit None checks (not `trow or {}`) because _target_lookup may
+    # return pandas Series objects whose truth value raises ValueError.
+    # ------------------------------------------------------------------
+    tids_str = [str(t) if t is not None else "" for t in tids]
+    progs    = [state._progress_dict.get(tid_s, {}) for tid_s in tids_str]
+    trows    = [state._target_lookup.get(tid_s) for tid_s in tids_str]
 
-        # Block must not have fully elapsed yet
-        if block_end <= t_now:
-            continue
+    def _trow_get(i: int, key: str, default):
+        tr = trows[i]
+        if tr is None:
+            return default
+        try:
+            return tr[key]
+        except (KeyError, TypeError, IndexError):
+            return default
 
-        target = state._target_lookup.get(target_id)
-        if target is None:
-            continue
+    # Tier filter
+    if not include_completed:
+        tier_ok = np.array([
+            int(progs[i].get("current_tier", 0)) < int(_trow_get(i, "max_tier", 1))
+            for i in range(n)
+        ], dtype=bool)
+    else:
+        tier_ok = np.ones(n, dtype=bool)
 
-        slew = slew_time_days(
-            ra1=state.current_ra, dec1=state.current_dec,
-            ra2=float(target["ra"]), dec2=float(target["dec"]),
-        )
-        t_arrive = t_now + slew
-        # Telescope must arrive before the block ends (any capture possible)
-        if t_arrive >= block_end:
-            continue
+    # ------------------------------------------------------------------
+    # Vectorised slew → t_arrive (one numpy call instead of N scalar calls)
+    # ------------------------------------------------------------------
+    ra2  = np.array([float(_trow_get(i, "ra",  0.0)) for i in range(n)])
+    dec2 = np.array([float(_trow_get(i, "dec", 0.0)) for i in range(n)])
+    slews    = slew_time_days_vec(state.current_ra, state.current_dec, ra2, dec2)
+    t_arrive = t_now + slews
 
-        if not permissive:
-            block_start = wmid - block_dur / 2.0
-            idle = max(0.0, block_start - t_arrive)
-            # Use actual captured duration (mirrors execute_observation)
-            if t_arrive <= block_start:
-                cap_frac = 1.0
-            else:
-                cap_frac = (block_end - t_arrive) / block_dur
-            captured_dur = cap_frac * block_dur
-            if not state.clock.can_fit(slew + idle + captured_dur + overhead):
-                continue
+    # ------------------------------------------------------------------
+    # Tier-capped captured duration for can_fit check
+    # ------------------------------------------------------------------
+    obs_rem  = np.array([float(progs[i].get("obs_remaining_next_tier", 1.0))
+                         for i in range(n)])
+    idle     = np.maximum(0.0, block_start - t_arrive)
+    safe_bd  = np.where(block_dur > 0, block_dur, 1e-9)
+    cap_frac = np.where(t_arrive <= block_start, 1.0,
+                        (block_end - t_arrive) / safe_bd)
+    eff_frac     = np.minimum(cap_frac, obs_rem)
+    captured_dur = eff_frac * block_dur
+    total_cost   = slews + idle + captured_dur + overhead
 
-        mask[i] = True
+    # ------------------------------------------------------------------
+    # Combine all conditions (fully vectorised boolean operations)
+    # ------------------------------------------------------------------
+    has_tid  = np.array([bool(s) for s in tids_str], dtype=bool)
+    has_trow = np.array([t is not None for t in trows],  dtype=bool)
 
+    mask = (
+        has_tid
+        & has_trow
+        & tier_ok
+        & vis_valid
+        & (block_end > t_now)       # block not yet expired
+        & (t_arrive < block_end)    # telescope can arrive in time
+        & (total_cost <= remaining) # fits before mission_end
+    )
     return mask
 
 

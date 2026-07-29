@@ -35,7 +35,8 @@ Implementation notes
 --------------------
 - rFF (row-wise FFN) is a single hidden-layer MLP applied independently per token.
 - Pre-LN (normalise before attention) is used throughout for training stability.
-- Padding positions are excluded from attention via a key_padding_mask.
+- Padding positions are suppressed via a float additive attn_mask (-1e9) rather
+  than a bool key_padding_mask, which has a known NaN bug on MPS (Apple Silicon).
 """
 
 from __future__ import annotations
@@ -102,12 +103,37 @@ class MAB(nn.Module):
         key_padding_mask : (B, Ny) bool, optional
             True at positions that should be ignored (padding tokens in Y).
         """
+        # MPS (Apple Silicon) has a known bug where nn.MultiheadAttention with a
+        # bool key_padding_mask produces NaN attention weights — even with partial
+        # masking, not only the all-masked case.  The fix is to bypass
+        # key_padding_mask entirely and instead pass a float additive attn_mask
+        # with shape (B*n_heads, L, S).  We use -1e9 rather than -inf so that
+        # softmax over all-masked positions produces a uniform distribution
+        # (~0 output) instead of 0/0 = NaN.
+        attn_mask = None
+        if key_padding_mask is not None:
+            B  = x.shape[0]
+            L  = x.shape[1]          # number of query positions
+            S  = y.shape[1]          # number of key positions
+            H  = self.attn.num_heads
+            # (B, S) bool → (B, S) float, True=pad → -1e9, False=valid → 0.0
+            float_mask = key_padding_mask.to(dtype=x.dtype) * -1e9   # (B, S)
+            # Broadcast over query positions and heads → (B*H, L, S)
+            float_mask = (
+                float_mask
+                .unsqueeze(1)           # (B, 1, S)
+                .unsqueeze(1)           # (B, 1, 1, S)
+                .expand(B, H, L, S)     # (B, H, L, S)
+                .reshape(B * H, L, S)   # (B*H, L, S)  — required by MHA
+            )
+            attn_mask = float_mask
+
         # Pre-LN attention: norm before attending
         h, _ = self.attn(
             query=self.norm1(x),
             key=self.norm1(y),
             value=self.norm1(y),
-            key_padding_mask=key_padding_mask,
+            attn_mask=attn_mask,        # float additive mask, no bool key_padding_mask
         )
         x = x + h
         x = x + self.ff(self.norm2(x))

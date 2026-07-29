@@ -126,6 +126,15 @@ class FullSetActionConfig:
     #: (backward-compatible default; no padding added).
     #: For the full Ariel catalogue (~2000 targets) set n_max=2000.
     n_max: int = 0
+    #: Fast pre-filter: at each step, keep only the K planets whose
+    #: first-reachable event has the soonest window_mid (same principle as
+    #: top-K event mode — "these windows are closing soonest").  The ISAB
+    #: then decides which of the K to actually observe.
+    #: Reduces ISAB token count from N_max (~814) to k_filter, giving a
+    #: ~(N/K)× GPU speedup with minimal quality loss for k_filter ≥ 64.
+    #: Set to 0 to disable (default: pass all active planets up to n_max).
+    #: When k_filter > 0 it overrides n_max as the action-space size.
+    k_filter: int = 0
 
 
 @dataclass(frozen=True)

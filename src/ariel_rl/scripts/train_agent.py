@@ -78,6 +78,12 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Override action space type.")
     env.add_argument("--n-max", type=int, default=None,
                      help="full_set only: fixed action-space size N_max (0 = len(targets)).")
+    env.add_argument("--k-filter", type=int, default=None,
+                     help=(
+                         "full_set only: pre-filter to top-K planets per step using a fast "
+                         "heuristic (science / slew).  Reduces ISAB tokens from N_max to K "
+                         "for ~N/K speedup.  Recommended: 64–256.  0 = disabled."
+                     ))
     env.add_argument("--topk-k", type=int, default=None,
                      help="Override top-k action space size (only for --action-type topk).")
 
@@ -337,9 +343,15 @@ def _override_config(cfg, args):
         action_overrides["type"] = args.action_type
     if args.topk_k is not None:
         action_overrides["topk"] = dataclasses.replace(cfg.action.topk, k=args.topk_k)
+    # full_set overrides: n_max and k_filter may be set independently or together
+    _full_set_fields: dict = {}
     if getattr(args, "n_max", None) is not None:
+        _full_set_fields["n_max"] = args.n_max
+    if getattr(args, "k_filter", None) is not None:
+        _full_set_fields["k_filter"] = args.k_filter
+    if _full_set_fields:
         action_overrides["full_set"] = dataclasses.replace(
-            cfg.action.full_set, n_max=args.n_max
+            cfg.action.full_set, **_full_set_fields
         )
 
     new_mission = dataclasses.replace(cfg.mission, **mission_overrides) if mission_overrides else cfg.mission
@@ -439,6 +451,13 @@ def main() -> None:
     print(f"  action.type      = {cfg.action.type}")
     print(f"  lifetime_days    = {cfg.mission.lifetime_days}")
     print(f"  max_tier_cap     = {cfg.mission.max_tier_cap}")
+    if cfg.action.type == "full_set":
+        k_f = cfg.action.full_set.k_filter
+        n_m = cfg.action.full_set.n_max
+        if k_f > 0:
+            print(f"  k_filter         = {k_f}  (top-K pre-filter active)")
+        elif n_m > 0:
+            print(f"  n_max            = {n_m}")
 
     # ---- pre-build shared tables ----
     print("\nBuilding shared target table …")

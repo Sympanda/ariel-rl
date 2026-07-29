@@ -163,9 +163,19 @@ class FullSetISABNet(nn.Module):
         # --- Embed planet tokens ---
         tokens = self.planet_proj(planets)          # (B, N, d)
 
+        # Zero out padding rows before ISAB so they contribute zero keys/values.
+        if padding_mask is not None:
+            tokens = tokens.masked_fill(padding_mask.unsqueeze(-1), 0.0)
+
         # --- ISAB layers ---
         for isab in self.isab_layers:
             tokens = isab(tokens, key_padding_mask=padding_mask)   # (B, N, d)
+
+        # Safety: MPS softmax-over-all-masked can still produce NaN in rare cases.
+        # Replace any NaN in token embeddings with 0 before the actor/critic heads.
+        # Padding positions will be masked to -inf in the logits anyway.
+        if not tokens.isfinite().all():
+            tokens = th.nan_to_num(tokens, nan=0.0, posinf=1e4, neginf=-1e4)
 
         # --- Actor: per-token logit conditioned on global mission state ---
         N = tokens.shape[1]
@@ -309,7 +319,9 @@ class FullSetISABPolicy(MaskableActorCriticPolicy):
         action_masks: Optional[th.Tensor] = None,
     ) -> Tuple[th.Tensor, th.Tensor, Optional[th.Tensor]]:
         """Returns (values, log_probs, entropy) for PPO update."""
-        logits, values = self._predict_logits_and_values(obs, action_masks)
+        obs_t = {k: th.as_tensor(v, dtype=th.float32).to(self.device)
+                 for k, v in obs.items()}
+        logits, values = self._predict_logits_and_values(obs_t, action_masks)
         dist = CategoricalDistribution(int(self.action_space.n))
         dist = dist.proba_distribution(action_logits=logits)
 
